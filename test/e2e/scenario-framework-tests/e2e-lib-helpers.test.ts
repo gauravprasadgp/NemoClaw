@@ -12,6 +12,7 @@ const RUNTIME_LIB = path.join(REPO_ROOT, "test/e2e/runtime/lib");
 const VALIDATION_SUITES = path.join(REPO_ROOT, "test/e2e/validation_suites");
 const VALIDATION_LIB = path.join(VALIDATION_SUITES, "lib");
 const ASSERT = path.join(VALIDATION_SUITES, "assert");
+const REBUILD_UPGRADE_LIB = path.join(VALIDATION_SUITES, "lib/rebuild_upgrade.sh");
 const FIXTURES = path.join(REPO_ROOT, "test/e2e/nemoclaw_scenarios/fixtures");
 const INSTALL_DIR = path.join(REPO_ROOT, "test/e2e/nemoclaw_scenarios/install");
 const RUN_SCENARIO = path.join(REPO_ROOT, "test/e2e/runtime/run-scenario.sh");
@@ -135,6 +136,96 @@ describe("E2E shell helpers", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 1.A — Logging helpers (lib/logging.sh)
 // ─────────────────────────────────────────────────────────────────────────────
+
+describe("rebuild/upgrade validation helpers", () => {
+  it("rebuild_upgrade_library_should_source_without_side_effects", () => {
+    const r = runBash(`
+      set -euo pipefail
+      . "${REBUILD_UPGRADE_LIB}"
+      declare -F rebuild_upgrade_require_context >/dev/null
+    `);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout + r.stderr).not.toMatch(/install|onboard|rebuild/i);
+  });
+
+  it("rebuild_upgrade_context_should_fail_with_missing_key_name", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-ru-"));
+    try {
+      fs.writeFileSync(path.join(tmp, "context.env"), "E2E_SCENARIO=test\n");
+      const r = runBash(
+        `
+        . "${REBUILD_UPGRADE_LIB}"
+        rebuild_upgrade_require_context
+      `,
+        { E2E_CONTEXT_DIR: tmp },
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/E2E_AGENT|E2E_SANDBOX_NAME|E2E_GATEWAY_URL/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuild_upgrade_context_should_pass_when_required_keys_present", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-ru-"));
+    try {
+      fs.writeFileSync(
+        path.join(tmp, "context.env"),
+        "E2E_SCENARIO=test\nE2E_AGENT=openclaw\nE2E_SANDBOX_NAME=sb\nE2E_GATEWAY_URL=http://127.0.0.1\n",
+      );
+      const r = runBash(
+        `
+        set -euo pipefail
+        . "${REBUILD_UPGRADE_LIB}"
+        rebuild_upgrade_require_context
+      `,
+        { E2E_CONTEXT_DIR: tmp },
+      );
+      expect(r.status, r.stderr).toBe(0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuild_upgrade_checks_should_allow_command_fakes", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-ru-"));
+    try {
+      fs.writeFileSync(
+        path.join(tmp, "context.env"),
+        "E2E_SCENARIO=test\nE2E_AGENT=openclaw\nE2E_SANDBOX_NAME=sb\nE2E_GATEWAY_URL=http://127.0.0.1\n",
+      );
+      const r = runBash(
+        `
+        set -euo pipefail
+        fake_sandbox() {
+          case "$*" in
+            *cat*) printf 'marker' ;;
+            *version*) printf 'OpenClaw 2.0.0' ;;
+            *models*) printf '{"data":[]}' ;;
+            *) true ;;
+          esac
+        }
+        . "${REBUILD_UPGRADE_LIB}"
+        rebuild_upgrade_assert_marker_preserved
+        rebuild_upgrade_assert_agent_version_upgraded
+        rebuild_upgrade_assert_inference_works
+      `,
+        {
+          E2E_CONTEXT_DIR: tmp,
+          REBUILD_UPGRADE_SANDBOX_CMD: "fake_sandbox",
+          E2E_REBUILD_MARKER_EXPECTED: "marker",
+          E2E_OLD_AGENT_VERSION: "1.0.0",
+        },
+      );
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain("suite.rebuild.workspace_state_preserved");
+      expect(r.stdout).toContain("suite.rebuild.agent_version_upgraded");
+      expect(r.stdout).toContain("suite.rebuild.inference_still_works");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("Phase 1.A logging helpers", () => {
   it("logging_should_emit_stable_pass_marker_when_e2e_pass_called", () => {
@@ -562,7 +653,14 @@ describe("baseline onboarding validation helper", () => {
       const ctx = path.join(tmp, "ctx");
       fs.mkdirSync(bin); fs.mkdirSync(ctx);
       fs.writeFileSync(path.join(ctx, "context.env"), "E2E_SANDBOX_NAME=sb1\nE2E_PROVIDER=nvidia\nE2E_INFERENCE_ROUTE=inference-local\n");
-      fs.writeFileSync(path.join(bin, "nemoclaw"), "#!/usr/bin/env bash\n[[ $1 == --help ]] && echo help && exit 0\n", { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, "nemoclaw"), `#!/usr/bin/env bash
+case "$*" in
+  --help) echo help;;
+  "sb1 status") echo 'status running gateway healthy sandbox running';;
+  "sb1 logs") echo baseline-log;;
+  *) echo "unexpected nemoclaw args: $*" >&2; exit 64;;
+esac
+`, { mode: 0o755 });
       fs.writeFileSync(path.join(bin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
       const r = runBash(`
         set -euo pipefail
@@ -571,11 +669,15 @@ describe("baseline onboarding validation helper", () => {
         baseline_assert_nemoclaw_on_path
         baseline_assert_openshell_on_path
         baseline_assert_nemoclaw_help_exits_zero
+        baseline_assert_sandbox_status_exits_zero
+        baseline_assert_logs_produce_output
       `, { E2E_CONTEXT_DIR: ctx, PATH: `${bin}:${process.env.PATH}` });
       expect(r.status, r.stderr).toBe(0);
       expect(r.stdout).toContain("PASS: validation.baseline_onboarding.nemoclaw_on_path");
       expect(r.stdout).toContain("PASS: validation.baseline_onboarding.openshell_on_path");
       expect(r.stdout).toContain("PASS: validation.baseline_onboarding.nemoclaw_help_exits_zero");
+      expect(r.stdout).toContain("PASS: validation.baseline_onboarding.sandbox_status");
+      expect(r.stdout).toContain("PASS: validation.baseline_onboarding.logs_available");
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
@@ -614,7 +716,12 @@ describe("sandbox lifecycle validation helper", () => {
     try {
       const bin = path.join(tmp, "bin"); fs.mkdirSync(bin);
       fs.writeFileSync(path.join(bin, "nemoclaw"), `#!/usr/bin/env bash
-case "$1" in list) echo sb1;; status) echo 'status running gateway healthy sandbox running';; logs) echo logline;; esac
+case "$*" in
+  list) echo sb1;;
+  "sb1 status") echo 'status running gateway healthy sandbox running';;
+  "sb1 logs") echo logline;;
+  *) echo "unexpected nemoclaw args: $*" >&2; exit 64;;
+esac
 `, { mode: 0o755 });
       fs.writeFileSync(path.join(bin, "openshell"), `#!/usr/bin/env bash
 echo lifecycle-ok
