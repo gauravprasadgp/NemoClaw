@@ -19,9 +19,7 @@ const { cleanupTempDir }: typeof import("./onboard/temp-files") = require("./onb
 const { stopStaleDashboardListenersForSandbox } = require("./onboard/stale-gateway-cleanup");
 const { bestEffortForwardStop } = require("./onboard/forward-cleanup");
 const { looksLikeForwardPortConflict, runBackgroundForwardStartWithPortReleaseRetries }: typeof import("./onboard/forward-start") = require("./onboard/forward-start");
-const {
-  ensureOllamaLoopbackSystemdOverride,
-}: typeof import("./onboard/ollama-systemd") = require("./onboard/ollama-systemd");
+const { ensureManagedOllamaLoopbackSystemdOverride, ensureOllamaLoopbackSystemdOverride }: typeof import("./onboard/ollama-systemd") = require("./onboard/ollama-systemd");
 const {
   CUSTOM_BUILD_CONTEXT_WARN_BYTES,
   isInsideIgnoredCustomBuildContextPath,
@@ -36,6 +34,7 @@ const {
 const {
   buildSandboxConfigSyncScript,
   writeSandboxConfigSyncFile,
+  runSandboxConfigSync,
 }: typeof import("./onboard/config-sync") = require("./onboard/config-sync");
 const dockerGpuPatch: typeof import("./onboard/docker-gpu-patch") = require("./onboard/docker-gpu-patch");
 const dockerGpuLocalInference: typeof import("./onboard/docker-gpu-local-inference") = require("./onboard/docker-gpu-local-inference");
@@ -206,6 +205,7 @@ const {
   getProviderSelectionConfig,
   parseGatewayInference,
 } = inferenceConfig;
+const { ensureResumeProviderReady } = require("./onboard/resume-provider-shim");
 
 const onboardProviders = require("./onboard/providers");
 const hermesProviderAuth = require("./hermes-provider-auth");
@@ -283,6 +283,14 @@ const {
   resolveProviderCredential,
   saveCredential,
 } = credentials;
+const credentialNavigation: typeof import("./onboard/credential-navigation") =
+  require("./onboard/credential-navigation");
+const {
+  BACK_TO_SELECTION,
+  createCredentialPromptHelpers,
+  getNavigationChoice,
+  isBackToSelection,
+} = credentialNavigation;
 const { hashCredential }: typeof import("./security/credential-hash") = require("./security/credential-hash");
 const {
   cleanupStaleHostFiles,
@@ -292,6 +300,13 @@ const { resolveSandboxImageTagFromCreateOutput } =
   require("./domain/sandbox/image-tag") as typeof import("./domain/sandbox/image-tag");
 const nim: typeof import("./inference/nim") = require("./inference/nim");
 const onboardSession: typeof import("./state/onboard-session") = require("./state/onboard-session");
+const { OnboardRuntimeBoundary }: typeof import("./onboard/runtime-boundary") = require("./onboard/runtime-boundary");
+const { handleAgentSetupState }: typeof import("./onboard/machine/handlers/agent-setup") = require("./onboard/machine/handlers/agent-setup");
+const { handleGatewayState }: typeof import("./onboard/machine/handlers/gateway") = require("./onboard/machine/handlers/gateway");
+const { handlePoliciesState }: typeof import("./onboard/machine/handlers/policies") = require("./onboard/machine/handlers/policies");
+const { handlePreflightState }: typeof import("./onboard/machine/handlers/preflight") = require("./onboard/machine/handlers/preflight");
+const { handleProviderInferenceState }: typeof import("./onboard/machine/handlers/provider-inference") = require("./onboard/machine/handlers/provider-inference");
+const { handleSandboxState }: typeof import("./onboard/machine/handlers/sandbox") = require("./onboard/machine/handlers/sandbox");
 const policies: typeof import("./policy") = require("./policy");
 const tiers: typeof import("./policy/tiers") = require("./policy/tiers");
 const { ensureUsageNoticeConsent } = require("./onboard/usage-notice");
@@ -377,6 +392,7 @@ import {
   setupHermesToolGateways,
   stringSetsEqual,
 } from "./onboard/hermes-managed-tools";
+import { mergePolicyMessagingChannels } from "./onboard/messaging-policy-presets";
 import {
   filterEnabledChannelsByAgent,
   getAvailableMessagingChannelsForAgent,
@@ -393,7 +409,7 @@ import { decidePolicyCarryForward } from "./onboard/policy-carryforward";
 import { getSuggestedPolicyPresets } from "./onboard/policy-presets";
 import {
   computeSetupPresetSuggestions as computeSetupPresetSuggestionsImpl,
-  isStaleBuiltinBravePolicyPreset,
+  preparePolicyPresetResumeSelection,
   type SetupPolicySelectionOptions,
   type SetupPresetSuggestionOptions,
   setupPoliciesWithSelection as setupPoliciesWithSelectionImpl,
@@ -406,6 +422,7 @@ import {
 } from "./onboard/sandbox-gpu-mode";
 import {
   exitOnSandboxGpuConfigErrors,
+  formatSandboxGpuPassthroughNote,
   sandboxGpuRemediationLines,
   validateSandboxGpuPreflight,
 } from "./onboard/sandbox-gpu-preflight";
@@ -429,7 +446,6 @@ const DIM = USE_COLOR ? "\x1b[2m" : "";
 const RESET = USE_COLOR ? "\x1b[0m" : "";
 let OPENSHELL_BIN: string | null = null;
 const GATEWAY_NAME = "nemoclaw";
-const BACK_TO_SELECTION = "__NEMOCLAW_BACK_TO_SELECTION__";
 type HermesAuthMethod = "oauth" | "api_key";
 const HERMES_AUTH_METHOD_OAUTH: HermesAuthMethod = "oauth";
 const HERMES_AUTH_METHOD_API_KEY: HermesAuthMethod = "api_key";
@@ -1318,19 +1334,13 @@ const {
   runCurlProbe,
 } = httpProbe;
 
-function getNavigationChoice(value = ""): "back" | "exit" | null {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (normalized === "back") return "back";
-  if (normalized === "exit" || normalized === "quit") return "exit";
-  return null;
-}
-
 function exitOnboardFromPrompt(): never {
   console.log("  Exiting onboarding.");
   process.exit(1);
 }
+
+const credentialPrompt = createCredentialPromptHelpers(exitOnboardFromPrompt);
+const replaceNamedCredential = credentialPrompt.replaceNamedCredential;
 
 function normalizeHermesAuthMethod(value: string | null | undefined): HermesAuthMethod | null {
   const normalized = String(value || "")
@@ -1421,7 +1431,7 @@ function stageNousApiKeyProviderEnv(): void {
   }
 }
 
-async function ensureHermesNousApiKeyEnv(): Promise<string> {
+async function ensureHermesNousApiKeyEnv(): Promise<string | typeof BACK_TO_SELECTION> {
   const existing = resolveHermesNousApiKey();
   if (existing) {
     process.env[HERMES_NOUS_API_KEY_CREDENTIAL_ENV] = existing;
@@ -1430,11 +1440,8 @@ async function ensureHermesNousApiKeyEnv(): Promise<string> {
   console.log("");
   console.log("  Hermes Provider Nous API Key");
   console.log(`  Create or copy a key from ${HERMES_NOUS_API_KEY_HELP_URL}`);
-  const key = normalizeCredentialValue(
-    await prompt("  Nous API Key: ", {
-      secret: true,
-    }),
-  );
+  const key = await credentialPrompt.readValue("  Nous API Key: ");
+  if (isBackToSelection(key)) return key;
   const validationError = validateNvidiaApiKeyValue(key, HERMES_NOUS_API_KEY_CREDENTIAL_ENV);
   if (validationError) {
     console.error(validationError);
@@ -1500,38 +1507,6 @@ const {
 
 // validateNvidiaApiKeyValue — see validation import above
 
-async function replaceNamedCredential(
-  envName: string,
-  label: string,
-  helpUrl: string | null = null,
-  validator: ((value: string) => string | null) | null = null,
-): Promise<string> {
-  if (helpUrl) {
-    console.log("");
-    console.log(`  Get your ${label} from: ${helpUrl}`);
-    console.log("");
-  }
-
-  while (true) {
-    const key = normalizeCredentialValue(await prompt(`  ${label}: `, { secret: true }));
-    if (!key) {
-      console.error(`  ${label} is required.`);
-      continue;
-    }
-    const validationError = typeof validator === "function" ? validator(key) : null;
-    if (validationError) {
-      console.error(validationError);
-      continue;
-    }
-    saveCredential(envName, key);
-    process.env[envName] = key;
-    console.log("");
-    console.log("  Credential staged. Onboarding will register it with the OpenShell gateway.");
-    console.log("");
-    return key;
-  }
-}
-
 async function promptValidationRecovery(
   label: string,
   recovery: ProbeRecovery,
@@ -1567,11 +1542,20 @@ async function promptValidationRecovery(
     // nvapi- prefix when credentialEnv === "NVIDIA_API_KEY", so passing it
     // unconditionally here is safe for Anthropic/OpenAI/Gemini too.
     const validator = (key: string) => validateNvidiaApiKeyValue(key, credentialEnv);
+    const replaceCredential = async (): Promise<"credential" | "selection"> => {
+      const result = await credentialPrompt.replaceNamedCredential(
+        credentialEnv,
+        `${label} API key`,
+        helpUrl,
+        validator,
+      );
+      if (credentialPrompt.returningToProviderSelection(result)) return "selection";
+      return "credential";
+    };
     if (looksLikeToken) {
       console.log("  ⚠️  That looks like an API key — do not paste credentials here.");
       console.log("  Treating as 'retry'. You will be prompted to enter the key securely.");
-      await replaceNamedCredential(credentialEnv, `${label} API key`, helpUrl, validator);
-      return "credential";
+      return replaceCredential();
     }
     if (choice === "back") {
       console.log("  Returning to provider selection.");
@@ -1582,8 +1566,7 @@ async function promptValidationRecovery(
       exitOnboardFromPrompt();
     }
     if (choice === "" || choice === "retry") {
-      await replaceNamedCredential(credentialEnv, `${label} API key`, helpUrl, validator);
-      return "credential";
+      return replaceCredential();
     }
     console.log("  Please choose a provider/model again.");
     console.log("");
@@ -1972,15 +1955,17 @@ async function promptBraveSearchRecovery(
   return "retry";
 }
 
-async function promptBraveSearchApiKey(): Promise<string> {
+async function promptBraveSearchApiKey(): Promise<string | typeof BACK_TO_SELECTION> {
   console.log("");
   console.log(`  Get your Brave Search API key from: ${BRAVE_SEARCH_HELP_URL}`);
   console.log("");
 
   while (true) {
-    const key = normalizeCredentialValue(
-      await prompt("  Brave Search API key: ", { secret: true }),
-    );
+    const value = await credentialPrompt.readValue("  Brave Search API key: ");
+    if (isBackToSelection(value)) {
+      return value;
+    }
+    const key = normalizeCredentialValue(value);
     if (!key) {
       console.error("  Brave Search API key is required.");
       continue;
@@ -1991,7 +1976,7 @@ async function promptBraveSearchApiKey(): Promise<string> {
 
 async function ensureValidatedBraveSearchCredential(
   nonInteractive = isNonInteractive(),
-): Promise<string | null> {
+): Promise<string | typeof BACK_TO_SELECTION | null> {
   const savedApiKey = getCredential(webSearch.BRAVE_API_KEY_ENV);
   let apiKey: string | null =
     savedApiKey || normalizeCredentialValue(process.env[webSearch.BRAVE_API_KEY_ENV]);
@@ -2004,7 +1989,11 @@ async function ensureValidatedBraveSearchCredential(
           "Brave Search requires BRAVE_API_KEY or a saved Brave Search credential in non-interactive mode.",
         );
       }
-      apiKey = await promptBraveSearchApiKey();
+      const promptedApiKey = await promptBraveSearchApiKey();
+      if (isBackToSelection(promptedApiKey)) {
+        return promptedApiKey;
+      }
+      apiKey = promptedApiKey;
       usingSavedKey = false;
     }
 
@@ -2081,6 +2070,9 @@ async function configureWebSearch(
   }
 
   const braveApiKey = await ensureValidatedBraveSearchCredential();
+  if (isBackToSelection(braveApiKey)) {
+    return configureWebSearch(existingConfig, agent, dockerfilePathOverride);
+  }
   if (!braveApiKey) {
     return null;
   }
@@ -2100,9 +2092,6 @@ function verifyWebSearchInsideSandbox(
   });
 }
 
-// getSandboxInferenceConfig — moved to onboard-providers.ts
-
-// Inference probes — moved to inference/onboard-probes.ts
 const {
   hasResponsesToolCall,
   hasChatCompletionsToolCall,
@@ -2128,6 +2117,7 @@ async function validateOpenAiLikeSelection(
     requireChatCompletionsToolCalling?: boolean;
     skipResponsesProbe?: boolean;
     probeStreaming?: boolean;
+    allowHostDockerInternal?: boolean;
   } = {},
 ): Promise<EndpointValidationResult> {
   const apiKey = credentialEnv ? getCredential(credentialEnv) : "";
@@ -2847,7 +2837,7 @@ function getOpenShellDockerSupervisorImage(versionOutput: string | null = null):
   if (shouldUseOpenshellDevChannel() || isOpenshellDevVersion(versionOutput)) {
     return "ghcr.io/nvidia/openshell/supervisor:dev";
   }
-  const supportedVersion = installedVersion ?? getBlueprintMaxOpenshellVersion() ?? "0.0.39";
+  const supportedVersion = installedVersion ?? getBlueprintMaxOpenshellVersion() ?? "0.0.44";
   return `ghcr.io/nvidia/openshell/supervisor:${supportedVersion}`;
 }
 
@@ -3178,23 +3168,6 @@ function attachGatewayMetadataIfNeeded({
   return false;
 }
 
-async function ensureNamedCredential(
-  envName: string | null,
-  label: string,
-  helpUrl: string | null = null,
-): Promise<string> {
-  if (!envName) {
-    console.error(`  Missing credential target for ${label}.`);
-    process.exit(1);
-  }
-  let key = getCredential(envName);
-  if (key) {
-    process.env[envName] = key;
-    return key;
-  }
-  return replaceNamedCredential(envName, label, helpUrl);
-}
-
 function waitForSandboxReady(sandboxName: string, attempts = 10, delaySeconds = 2): boolean {
   for (let i = 0; i < attempts; i += 1) {
     const list = runCaptureOpenshell(["sandbox", "list"], { ignoreError: true });
@@ -3235,19 +3208,14 @@ function waitForSandboxReady(sandboxName: string, attempts = 10, delaySeconds = 
 
 // ── Step 1: Preflight ────────────────────────────────────────────
 
-// CDI spec gap (#3152). When Docker is configured for CDI device injection
-// (CDISpecDirs is set) but no nvidia.com/gpu spec is present, OpenShell's
-// `gateway start --gpu` fails minutes later with `unresolvable CDI devices
-// nvidia.com/gpu=all`. Block now and surface `nvidia-ctk cdi generate`. The
-// check is a no-op when the user opts out of GPU passthrough (--no-gpu),
-// since the legacy nvidia runtime does not need a CDI spec.
-//
-// Extracted so the same guard runs on the `--resume` branch, where preflight()
-// itself is skipped via the cached session.
+// Keep the Docker CDI guard near preflight so resume hits the same early failure path.
+// Jetson/Tegra uses Docker's NVIDIA runtime backend and is exempt from CDI.
 function assertCdiNvidiaGpuSpecPresent(
   host: ReturnType<typeof assessHost>,
   optedOutGpuPassthrough: boolean,
+  hostGpuPlatform: string | null | undefined = null,
 ): void {
+  if (hostGpuPlatform === "jetson") return;
   if (!host.cdiNvidiaGpuSpecMissing || optedOutGpuPassthrough) return;
   console.error(
     "  Docker is configured for CDI device injection (CDISpecDirs is set), but no",
@@ -3294,7 +3262,7 @@ async function preflight(
     preflightOpts.optedOutGpuPassthrough === true ||
     preflightOpts.noGpu === true ||
     !sandboxGpuConfig.sandboxGpuEnabled;
-  assertCdiNvidiaGpuSpecPresent(host, optedOutGpuPassthrough);
+  assertCdiNvidiaGpuSpecPresent(host, optedOutGpuPassthrough, sandboxGpuConfig.hostGpuPlatform);
 
   // DNS resolution from inside containers (#2101). A corp firewall that
   // blocks outbound UDP:53 to public resolvers leaves the sandbox build
@@ -4100,7 +4068,7 @@ async function startDockerDriverGateway({ exitOnFailure = true, skipSandboxBridg
   }
   if (!gatewayBin) {
     console.error("  OpenShell Docker-driver gateway binary not found.");
-    console.error("  Install OpenShell v0.0.39, or set NEMOCLAW_OPENSHELL_GATEWAY_BIN.");
+    console.error("  Install OpenShell v0.0.44, or set NEMOCLAW_OPENSHELL_GATEWAY_BIN.");
     if (exitOnFailure) process.exit(1);
     throw new Error("OpenShell gateway binary not found");
   }
@@ -5354,14 +5322,14 @@ async function createSandbox(
   // Pull the base image and resolve its digest so the Dockerfile is pinned to
   // exactly what we just fetched. This prevents stale :latest tags from
   // silently reusing a cached old image after NemoClaw upgrades (#1904).
-  const resolved = pullAndResolveBaseImageDigest({
+  const resolved = agent && !fromDockerfile ? null : pullAndResolveBaseImageDigest({
     requireOpenshellSandboxAbi: isLinuxDockerDriverGatewayEnabled(),
   });
   if (resolved?.digest) {
     console.log(`  Pinning base image to ${resolved.digest.slice(0, 19)}...`);
   } else if (resolved) {
     console.log(`  Using sandbox base image ${resolved.ref}`);
-  } else {
+  } else if (!(agent && !fromDockerfile)) {
     // Check if the image exists locally before falling back to unpinned :latest.
     // On a first-time install behind a firewall with no cached image, warn early
     // so the user knows the build will likely fail.
@@ -5495,6 +5463,7 @@ async function createSandbox(
     gpuDevice: effectiveSandboxGpuConfig.sandboxGpuDevice,
     openshellSandboxCommand: sandboxStartupCommand,
     timeoutSecs: sandboxReadyTimeoutSecs,
+    backend: effectiveSandboxGpuConfig.hostGpuPlatform === "jetson" ? "jetson" : "generic",
     deps: { runOpenshell, runCaptureOpenshell, sleep },
   });
   const createResult = await streamSandboxCreate(createCommand, sandboxEnv, {
@@ -5945,13 +5914,13 @@ async function selectAndValidateOllamaModel(
   const { requestedModel, recoveredModel } = defaults;
   while (true) {
     const installedModels = getOllamaModelOptions();
-    let model: string;
+    let model: string | typeof BACK_TO_SELECTION;
     if (isNonInteractive()) {
       model = requestedModel || recoveredModel || getDefaultOllamaModel(gpu);
     } else {
       model = await promptOllamaModel(gpu);
     }
-    if (model === BACK_TO_SELECTION) {
+    if (isBackToSelection(model)) {
       console.log("  Returning to provider selection.");
       console.log("");
       return { outcome: "back-to-selection" };
@@ -6008,6 +5977,8 @@ async function selectAndValidateOllamaModel(
       {
         skipResponsesProbe: true,
         requireChatCompletionsToolCalling: true,
+        allowHostDockerInternal:
+          localInference.getResolvedOllamaHost() === OLLAMA_HOST_DOCKER_INTERNAL,
       },
     );
     if (validation.retry === "selection") return { outcome: "back-to-selection" };
@@ -6039,7 +6010,7 @@ async function setupNim(
 }> {
   step(3, 8, "Configuring inference provider");
 
-  let model: string | null = null;
+  let model: string | typeof BACK_TO_SELECTION | null = null;
   let provider: string = REMOTE_PROVIDER_CONFIG.build.providerName;
   let nimContainer: string | null = null;
   let endpointUrl: string | null = REMOTE_PROVIDER_CONFIG.build.endpointUrl;
@@ -6047,6 +6018,16 @@ async function setupNim(
   let hermesAuthMethod: HermesAuthMethod | null = null;
   let hermesToolGateways: string[] = [];
   let preferredInferenceApi: string | null = null;
+  const resetSelectionAttemptState = () => {
+    model = null;
+    provider = REMOTE_PROVIDER_CONFIG.build.providerName;
+    nimContainer = null;
+    endpointUrl = REMOTE_PROVIDER_CONFIG.build.endpointUrl;
+    credentialEnv = REMOTE_PROVIDER_CONFIG.build.credentialEnv;
+    hermesAuthMethod = null;
+    hermesToolGateways = [];
+    preferredInferenceApi = null;
+  };
 
   // Detect local inference options. Bound curl with --connect-timeout/--max-time
   // so a half-open port or stalled listener cannot hang the onboard at step 3
@@ -6211,12 +6192,12 @@ async function setupNim(
 
   if (options.length > 1) {
     selectionLoop: while (true) {
+      resetSelectionAttemptState();
       let selected: ProviderChoice | undefined;
       // Hoisted so downstream model-selection branches can fall back to a
       // recorded model from the same recovery decision.
       let recoveredFromSandbox = false;
       let recoveredModel: string | null = null;
-      hermesAuthMethod = null;
 
       if (isNonInteractive() || requestedProvider) {
         let providerKey = requestedProvider;
@@ -6409,10 +6390,8 @@ async function setupNim(
 
         if (selected.key === "hermesProvider") {
           const selectedHermesAuthMethod = await promptHermesAuthMethod();
-          if (selectedHermesAuthMethod === BACK_TO_SELECTION) {
+          if (credentialPrompt.returningToProviderSelection(selectedHermesAuthMethod)) {
             hermesAuthMethod = null;
-            console.log("  Returning to provider selection.");
-            console.log("");
             continue selectionLoop;
           }
           hermesAuthMethod = selectedHermesAuthMethod;
@@ -6427,7 +6406,11 @@ async function setupNim(
                 process.exit(1);
               }
             } else {
-              await ensureHermesNousApiKeyEnv();
+              const hermesCredentialResult = await ensureHermesNousApiKeyEnv();
+              if (credentialPrompt.returningToProviderSelection(hermesCredentialResult)) {
+                hermesAuthMethod = null;
+                continue selectionLoop;
+              }
             }
           } else {
             credentialEnv = remoteConfig.credentialEnv;
@@ -6470,11 +6453,7 @@ async function setupNim(
               },
             );
           }
-          if (model === BACK_TO_SELECTION) {
-            console.log("  Returning to provider selection.");
-            console.log("");
-            continue selectionLoop;
-          }
+          if (credentialPrompt.returningToProviderSelection(model)) continue selectionLoop;
           preferredInferenceApi = "openai-completions";
           console.log(`  Using ${remoteConfig.label} with model: ${model}`);
           break;
@@ -6511,7 +6490,7 @@ async function setupNim(
               process.exit(1);
             }
           } else {
-            await ensureApiKey();
+            if (credentialPrompt.returningToProviderSelection(await ensureApiKey())) continue selectionLoop;
           }
           const _envModel = (process.env.NEMOCLAW_MODEL || "").trim();
           model =
@@ -6521,11 +6500,7 @@ async function setupNim(
               ? DEFAULT_CLOUD_MODEL
               : await promptCloudModel({ defaultModelId: _envModel || undefined })) ||
             DEFAULT_CLOUD_MODEL;
-          if (model === BACK_TO_SELECTION) {
-            console.log("  Returning to provider selection.");
-            console.log("");
-            continue selectionLoop;
-          }
+          if (credentialPrompt.returningToProviderSelection(model)) continue selectionLoop;
         } else {
           // NEMOCLAW_PROVIDER_KEY is a universal alias: if the specific credential env
           // isn't already set, use NEMOCLAW_PROVIDER_KEY as the API key for this provider.
@@ -6559,7 +6534,7 @@ async function setupNim(
             backToSelection: BACK_TO_SELECTION,
             isNonInteractive,
             promptInputModel,
-            replaceNamedCredential,
+            replaceNamedCredential: credentialPrompt.replaceNamedCredential,
           });
           if (bedrockSelection.action === "retry-selection") {
             console.log("  Returning to provider selection.");
@@ -6579,11 +6554,12 @@ async function setupNim(
               process.exit(1);
             }
           } else {
-            await ensureNamedCredential(
+            const credentialResult = await credentialPrompt.ensureNamedCredential(
               selectedCredentialEnv,
               remoteConfig.label + " API key",
               remoteConfig.helpUrl,
             );
+            if (credentialPrompt.returningToProviderSelection(credentialResult)) continue selectionLoop;
           }
           let modelValidator: ((candidate: string) => ModelValidationResult) | null = null;
           if (selected.key === "openai" || selected.key === "gemini") {
@@ -6617,11 +6593,7 @@ async function setupNim(
             } else {
               model = await promptInputModel(remoteConfig.label, defaultModel, modelValidator);
             }
-            if (model === BACK_TO_SELECTION) {
-              console.log("  Returning to provider selection.");
-              console.log("");
-              continue selectionLoop;
-            }
+            if (credentialPrompt.returningToProviderSelection(model)) continue selectionLoop;
 
             if (selected.key === "custom") {
               const validation = await validateCustomOpenAiLikeSelection(
@@ -6780,6 +6752,7 @@ async function setupNim(
         const models = nim.listModels().filter((m) => m.minGpuMemoryMB <= localGpu.totalMemoryMB);
         if (models.length === 0) {
           console.log("  No NIM models fit your GPU VRAM. Falling back to cloud API.");
+          model = requestedModel || (recoveredFromSandbox && recoveredModel) || DEFAULT_CLOUD_MODEL;
         } else {
           let sel;
           if (isNonInteractive()) {
@@ -6824,9 +6797,8 @@ async function setupNim(
             console.log("  NGC API Key required to pull NIM images.");
             console.log("  Get one from: https://org.ngc.nvidia.com/setup/api-key");
             console.log("");
-            let ngcKey = normalizeCredentialValue(
-              await prompt("  NGC API Key: ", { secret: true }),
-            );
+            let ngcKey = await credentialPrompt.readValue("  NGC API Key: ");
+            if (credentialPrompt.returningToProviderSelection(ngcKey)) continue selectionLoop;
             if (!ngcKey) {
               console.error("  NGC API Key is required for Local NIM.");
               process.exit(1);
@@ -6834,7 +6806,8 @@ async function setupNim(
             if (!nim.dockerLoginNgc(ngcKey)) {
               console.error("  Failed to login to NGC registry. Check your API key and try again.");
               console.log("");
-              ngcKey = normalizeCredentialValue(await prompt("  NGC API Key: ", { secret: true }));
+              ngcKey = await credentialPrompt.readValue("  NGC API Key: ");
+              if (credentialPrompt.returningToProviderSelection(ngcKey)) continue selectionLoop;
               if (!ngcKey || !nim.dockerLoginNgc(ngcKey)) {
                 console.error("  NGC login failed. Cannot pull NIM images.");
                 process.exit(1);
@@ -6856,9 +6829,9 @@ async function setupNim(
               console.log("");
               console.log("  NGC API Key required to download NIM model weights at runtime.");
               console.log("  (Docker is logged in to nvcr.io, but the key was not saved.)");
-              ngcApiKey = normalizeCredentialValue(
-                await prompt("  NGC API Key: ", { secret: true }),
-              );
+              const ngcKey = await credentialPrompt.readValue("  NGC API Key: ");
+              if (credentialPrompt.returningToProviderSelection(ngcKey)) continue selectionLoop;
+              ngcApiKey = ngcKey || null;
             }
           }
 
@@ -7088,7 +7061,7 @@ async function setupNim(
           // daemon with our own `ollama serve`). This also repairs older
           // NemoClaw-created overrides that exposed raw Ollama on all interfaces.
           // WSL and non-systemd Linux fall back to a manual loopback launch.
-          const overrideState = ensureOllamaLoopbackSystemdOverride({ isNonInteractive });
+          const overrideState = ensureManagedOllamaLoopbackSystemdOverride({ isNonInteractive });
           if (overrideState === "failed") {
             console.error(
               "  Ollama systemd restart did not recover after applying the loopback override.",
@@ -7197,6 +7170,9 @@ async function setupNim(
           console.error("  Local vLLM validation URL could not be determined.");
           process.exit(1);
         }
+        if (isBackToSelection(model)) {
+          continue selectionLoop;
+        }
         const validation = await validateOpenAiLikeSelection(
           "Local vLLM",
           validationBaseUrl,
@@ -7253,7 +7229,13 @@ async function setupNim(
             console.log("  Model Router accepts NVIDIA API keys (nvapi-...).");
             console.log("  Get one at https://build.nvidia.com");
             console.log("");
-            await ensureNamedCredential(routerCredentialEnv, "Model Router API key", null);
+            const routerCredentialResult = await credentialPrompt.ensureNamedCredential(
+              routerCredentialEnv,
+              "Model Router API key",
+              null,
+            );
+            if (credentialPrompt.returningToProviderSelection(routerCredentialResult))
+              continue selectionLoop;
           }
         }
         provider = bp.provider_name || "nvidia-router";
@@ -7273,7 +7255,7 @@ async function setupNim(
   }
 
   return {
-    model,
+    model: isBackToSelection(model) ? null : model,
     provider,
     endpointUrl,
     credentialEnv,
@@ -7823,7 +7805,7 @@ async function setupMessagingChannels(
       output.write(`    [${i + 1}] ${marker} ${ch.name} — ${ch.description}${status}\n`);
     });
     output.write("\n");
-    output.write(`  Press 1-${availableChannels.length} to toggle, Enter when done: `);
+    output.write(`  Press 1-${availableChannels.length} to toggle, Enter when done (none selected skips): `);
   };
 
   showList();
@@ -7930,28 +7912,21 @@ async function setupMessagingChannels(
 
 // ── Step 7: OpenClaw ─────────────────────────────────────────────
 
-async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
-  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
-
-  const selectionConfig = getProviderSelectionConfig(provider, model);
-  if (selectionConfig) {
-    const sandboxConfig = {
-      ...selectionConfig,
-      onboardedAt: new Date().toISOString(),
-    };
-    const script = buildSandboxConfigSyncScript(sandboxConfig);
-    const scriptFile = writeSandboxConfigSyncFile(script);
-    try {
-      const scriptContent = fs.readFileSync(scriptFile, "utf-8");
-      run(openshellArgv(["sandbox", "connect", sandboxName]), {
+function syncNemoClawConfigInSandbox(sandboxName: string, provider: string, model: string): void {
+  runSandboxConfigSync(sandboxName, {
+    getSelectionConfig: () => getProviderSelectionConfig(provider, model),
+    runConnectScript: (name, scriptContent) => {
+      run(openshellArgv(["sandbox", "connect", name]), {
         stdio: ["pipe", "ignore", "inherit"],
         input: scriptContent,
       });
-    } finally {
-      cleanupTempDir(scriptFile, "nemoclaw-sync");
-    }
-  }
+    },
+  });
+}
 
+async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
+  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
+  syncNemoClawConfigInSandbox(sandboxName, provider, model);
   console.log(`  ✓ ${agentProductName()} gateway launched inside sandbox`);
 }
 
@@ -8921,27 +8896,15 @@ function toSessionUpdates(
   return normalized;
 }
 
-function startRecordedStep(
-  stepName: string,
-  updates: {
-    sandboxName?: string | null;
-    provider?: string | null;
-    model?: string | null;
-    policyPresets?: string[] | null;
-  } = {},
-): void {
-  onboardSession.markStepStarted(stepName);
-  if (Object.keys(updates).length > 0) {
-    onboardSession.updateSession((session: Session) => {
-      if (updates.sandboxName !== undefined) session.sandboxName = updates.sandboxName;
-      if (updates.provider !== undefined) session.provider = updates.provider;
-      if (updates.model !== undefined) session.model = updates.model;
-      if (updates.policyPresets !== undefined) session.policyPresets = updates.policyPresets;
-      return session;
-    });
-  }
-  maybeForceE2eStepFailure(stepName);
-}
+const onboardRuntimeBoundary = new OnboardRuntimeBoundary({
+  toSessionUpdates,
+  maybeForceE2eStepFailure,
+});
+const startRecordedStep = onboardRuntimeBoundary.startRecordedStep.bind(onboardRuntimeBoundary);
+const recordStepComplete = onboardRuntimeBoundary.recordStepComplete.bind(onboardRuntimeBoundary);
+const recordStepSkipped = onboardRuntimeBoundary.recordStepSkipped.bind(onboardRuntimeBoundary);
+const recordStepFailed = onboardRuntimeBoundary.recordStepFailed.bind(onboardRuntimeBoundary);
+const recordSessionComplete = onboardRuntimeBoundary.recordSessionComplete.bind(onboardRuntimeBoundary);
 
 const ONBOARD_STEP_INDEX: Record<string, { number: number; title: string }> = {
   preflight: { number: 1, title: "Preflight checks" },
@@ -8978,6 +8941,7 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
   RECREATE_SANDBOX = opts.recreateSandbox || process.env.NEMOCLAW_RECREATE_SANDBOX === "1";
   AUTO_YES = opts.autoYes === true || process.env.NEMOCLAW_YES === "1";
   _preflightDashboardPort = opts.controlUiPort || null;
+  onboardRuntimeBoundary.reset();
   delete process.env.OPENSHELL_GATEWAY;
   const resume = opts.resume === true;
   const fresh = opts.fresh === true;
@@ -9299,7 +9263,6 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
 
     const recordedSandboxName =
       session?.steps?.sandbox?.status === "complete" ? session?.sandboxName || null : null;
-    const resumeSandboxNameForGpu = recordedSandboxName || requestedSandboxName || null;
 
     console.log("");
     console.log(`  ${cliDisplayName()} Onboarding`);
@@ -9308,66 +9271,52 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
     console.log("  ===================");
 
     const explicitSandboxGpuFlag = resolveSandboxGpuFlagFromOptions(opts);
-    const resumePreflight = resume && session?.steps?.preflight?.status === "complete";
-    const resumeHasResolvedGpuIntent =
-      resumePreflight &&
-      explicitSandboxGpuFlag === null &&
-      opts.sandboxGpuDevice == null &&
-      process.env.NEMOCLAW_SANDBOX_GPU === undefined &&
-      process.env.NEMOCLAW_SANDBOX_GPU_DEVICE === undefined;
-    const resumedSandboxGpuOverrides = resumeHasResolvedGpuIntent
-      ? getResumeSandboxGpuOverrides(
-          resumeSandboxNameForGpu ? registry.getSandbox(resumeSandboxNameForGpu) : null,
-          session?.gpuPassthrough,
-        )
-      : { flag: null, device: null };
-    const effectiveSandboxGpuFlag = explicitSandboxGpuFlag ?? resumedSandboxGpuOverrides.flag;
-    const effectiveSandboxGpuDevice = opts.sandboxGpuDevice ?? resumedSandboxGpuOverrides.device;
-    let gpu;
-    if (resumePreflight) {
-      skippedStepMessage("preflight", "cached");
-      gpu = nim.detectGpu();
-      const resumeSandboxGpuConfig = resolveSandboxGpuConfig(gpu, {
-        flag: effectiveSandboxGpuFlag,
-        device: effectiveSandboxGpuDevice,
-      });
-      exitOnSandboxGpuConfigErrors(resumeSandboxGpuConfig);
-      // Re-check the CDI spec gap on resume (#3152). The cached preflight
-      // result does not capture host CDI state, and the original onboard
-      // attempt that wrote the cache likely aborted at gateway-start with
-      // exactly this CDI failure — so resuming without re-checking would
-      // walk into the same wall. Honour persisted `gpuPassthrough: false`
-      // from the prior session as an opt-out, since the resume invocation
-      // does not need to re-pass `--no-gpu` to keep that intent (the same
-      // resolution is replayed a few lines below for `gpuPassthrough`).
-      const resumeOptedOutGpuPassthrough =
-        opts.noGpu === true ||
-        (opts.gpu !== true && session?.gpuPassthrough === false) ||
-        !resumeSandboxGpuConfig.sandboxGpuEnabled;
-      assertCdiNvidiaGpuSpecPresent(assessHost(), resumeOptedOutGpuPassthrough);
-      validateSandboxGpuPreflight(resumeSandboxGpuConfig);
-    } else {
-      startRecordedStep("preflight");
-      gpu = await preflight({ ...opts, optedOutGpuPassthrough: opts.noGpu === true });
-      onboardSession.markStepComplete("preflight");
-    }
-    const sandboxGpuConfig = resolveSandboxGpuConfig(gpu, {
-      flag: effectiveSandboxGpuFlag,
-      device: effectiveSandboxGpuDevice,
+    const recordedGpuPassthroughBeforePreflight = session?.gpuPassthrough === true;
+    const preflightResult = await handlePreflightState({
+      resume,
+      session,
+      recordedSandboxName,
+      requestedSandboxName,
+      explicitSandboxGpuFlag,
+      sandboxGpuDevice: opts.sandboxGpuDevice ?? null,
+      gpuRequested: opts.gpu === true,
+      noGpu: opts.noGpu === true,
+      env: process.env,
+      deps: {
+        getSandbox: registry.getSandbox.bind(registry),
+        getResumeSandboxGpuOverrides,
+        detectGpu: nim.detectGpu,
+        runPreflight: (preflightOptions) => preflight({ ...opts, ...preflightOptions }),
+        assessHost,
+        assertCdiNvidiaGpuSpecPresent,
+        resolveSandboxGpuConfig,
+        validateSandboxGpuPreflight,
+        skippedStepMessage,
+        startRecordedStep,
+        recordStepComplete,
+        updateSession: onboardSession.updateSession,
+      },
     });
-
-    const requestedGpuPassthrough = opts.gpu === true;
-    const gpuPassthrough = sandboxGpuConfig.sandboxGpuEnabled;
+    session = preflightResult.session;
+    const {
+      sandboxGpuConfig,
+      resumeHasResolvedGpuIntent,
+      requestedGpuPassthrough,
+      gpuPassthrough,
+    } = preflightResult;
+    const gpu = preflightResult.gpu ?? null;
     if (gpuPassthrough) {
       note(
-        resumeHasResolvedGpuIntent && session?.gpuPassthrough === true
-          ? "  [resume] Continuing GPU passthrough from the saved onboarding session."
-          : requestedGpuPassthrough || sandboxGpuConfig.mode === "1"
-            ? "  GPU passthrough requested; passing --gpu to OpenShell gateway and sandbox creation."
-            : "  NVIDIA GPU detected; enabling OpenShell GPU passthrough. Use --no-gpu to opt out.",
+        formatSandboxGpuPassthroughNote({
+          hostGpuPlatform: sandboxGpuConfig.hostGpuPlatform,
+          resumeHasResolvedGpuIntent,
+          recordedGpuPassthroughBeforePreflight,
+          requestedGpuPassthrough,
+          sandboxGpuMode: sandboxGpuConfig.mode,
+        }),
       );
     } else if (gpu?.platform === "jetson") {
-      note("  GPU sandbox passthrough disabled by default on Jetson.");
+      note("  Sandbox GPU disabled by configuration on Jetson/Tegra.");
     } else if (process.platform === "linux" && !opts.noGpu) {
       try {
         const lspci = spawnSync("lspci", { encoding: "utf-8", timeout: 5000 });
@@ -9379,139 +9328,46 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
         /* lspci not available — skip hint */
       }
     }
-    // Persist GPU intent in the session so resume can restore it.
-    if (session && session.gpuPassthrough !== gpuPassthrough) {
-      session = onboardSession.updateSession((current: Session) => {
-        current.gpuPassthrough = gpuPassthrough;
-        return current;
-      });
-    }
     dockerGpuLocalInference.configureLocalInferenceForDockerGpuHostNetwork(sandboxGpuConfig, {
       dockerDriverGateway: isLinuxDockerDriverGatewayEnabled(),
       note,
     });
 
     const gatewaySnapshot = selectNamedGatewayForReuseIfNeeded(getGatewayReuseSnapshot());
-    let gatewayReuseState = gatewaySnapshot.gatewayReuseState;
-    gatewayReuseState = await refreshDockerDriverGatewayReuseState(gatewayReuseState);
-
-    // Verify the legacy gateway container is actually running — openshell CLI
-    // metadata can be stale after a manual `docker rm`. See #2020. Newer
-    // package-managed OpenShell gateways do not have an openshell-cluster-*
-    // Docker container, so the live CLI health check is the source of truth.
-    if (gatewayReuseState === "healthy" && gatewayCliSupportsLifecycleCommands(runCaptureOpenshell)) {
-      const containerState = verifyGatewayContainerRunning(GATEWAY_NAME);
-      if (containerState === "missing") {
-        console.log("  Gateway metadata is stale (container not running). Cleaning up...");
-        bestEffortForwardStop(runOpenshell, DASHBOARD_PORT);
-        gatewayReuseState = destroyGatewayForReuse(
-          destroyGateway,
-          "  ✓ Stale gateway metadata cleaned up",
-          "  ! Stale gateway metadata cleanup failed; leaving registry state intact.",
-        );
-      } else if (containerState === "unknown") {
-        // Docker probe failed but cached metadata says healthy. Try the host-level
-        // HTTP probe — it doesn't depend on Docker, so it can confirm the gateway
-        // is genuinely serving even when the daemon is flaky.
-        if (await waitForGatewayHttpReady()) {
-          console.log(
-            "  Warning: could not verify gateway container state (Docker may be unavailable), but the gateway is responding on HTTP. Proceeding with reuse.",
-          );
-        } else {
-          // Docker can't be probed AND the gateway HTTP endpoint isn't
-          // responding. We cannot tell whether the existing gateway is live
-          // (transient `docker inspect` flake + warm-up miss) or genuinely
-          // gone. Per #2020 we must not destroy in this branch, and we must
-          // not downgrade to "missing" either: that would push execution into
-          // `startGatewayWithOptions`, whose retry hook calls
-          // `destroyGateway()` between attempts — which would tear down a
-          // possibly-live gateway. Bail with an actionable error instead.
-          console.log(
-            `  Error: could not verify gateway container state and ${getGatewayLocalEndpoint()}/ is not responding.`,
-          );
-          console.log(
-            "  Refusing to proceed without a clear Docker signal — restarting Docker and re-running onboard is the safe path. See #3258 / #2020.",
-          );
-          process.exit(1);
-        }
-      } else if (!(await waitForGatewayHttpReady())) {
-        // Container is running but the gateway HTTP endpoint is not responding.
-        // Common immediately after a Docker daemon restart — the container comes
-        // back before the OpenShell gateway upstream finishes warming up. Safe to
-        // recreate because Docker is functional. See #3258.
-        console.log(
-          `  Gateway container is running but ${getGatewayLocalEndpoint()}/ is not responding. Recreating...`,
-        );
-        bestEffortForwardStop(runOpenshell, DASHBOARD_PORT);
-        gatewayReuseState = destroyGatewayForReuse(
-          destroyGateway,
-          "  ✓ Stale gateway cleaned up",
-          "  ! Stale gateway cleanup failed; leaving registry state intact.",
-        );
-      } else {
-        const imageDrift = getGatewayClusterImageDrift();
-        if (imageDrift) {
-          console.log(
-            `  Gateway image ${imageDrift.currentVersion} does not match openshell ${imageDrift.expectedVersion}. Recreating...`,
-          );
-          stopAllDashboardForwards();
-          gatewayReuseState = destroyGatewayForReuse(
-            destroyGateway,
-            "  ✓ Previous gateway cleaned up",
-            "  ! Previous gateway cleanup failed; leaving registry state intact.",
-          );
-        }
-      }
-    }
-
-    gatewayReuseState = reconcileGatewayGpuReuseForGpuIntent({
-      gatewayReuseState,
+    const gatewayResult = await handleGatewayState({
+      resume,
+      session,
+      initialGatewayReuseState: gatewaySnapshot.gatewayReuseState,
+      gpu,
       gpuPassthrough,
       gatewayName: GATEWAY_NAME,
-      currentSandboxName: recordedSandboxName || requestedSandboxName,
-      hostGpuPlatform: gpu?.platform ?? null,
+      recordedSandboxName,
+      requestedSandboxName,
       recreateSandbox: isRecreateSandbox(),
-      confirmedDockerDriverGateway:
-        isLinuxDockerDriverGatewayEnabled() &&
-        gatewayReuseState === "healthy" &&
-        !gatewayCliSupportsLifecycleCommands(runCaptureOpenshell),
-      stopDashboardForwards: stopAllDashboardForwards,
-      retireLegacyGatewayForDockerDriverUpgrade,
-      destroyGatewayRuntimeForGpuReuse: () => destroyGateway(() => undefined, () => false),
+      deps: {
+        refreshDockerDriverGatewayReuseState,
+        gatewayCliSupportsLifecycleCommands: () => gatewayCliSupportsLifecycleCommands(runCaptureOpenshell),
+        verifyGatewayContainerRunning,
+        waitForGatewayHttpReady,
+        getGatewayLocalEndpoint,
+        stopDashboardForward: () => bestEffortForwardStop(runOpenshell, DASHBOARD_PORT),
+        destroyGateway,
+        destroyGatewayForReuse,
+        getGatewayClusterImageDrift,
+        stopAllDashboardForwards,
+        reconcileGatewayGpuReuseForGpuIntent,
+        isLinuxDockerDriverGatewayEnabled,
+        retireLegacyGatewayForDockerDriverUpgrade,
+        destroyGatewayRuntimeForGpuReuse: () => destroyGateway(() => undefined, () => false),
+        skippedStepMessage,
+        note,
+        startRecordedStep,
+        startGateway,
+        recordStepComplete,
+        exitProcess: (code) => process.exit(code),
+      },
     });
-
-    const canReuseHealthyGateway = gatewayReuseState === "healthy";
-
-    const resumeGateway =
-      resume && session?.steps?.gateway?.status === "complete" && canReuseHealthyGateway;
-    if (resumeGateway) {
-      skippedStepMessage("gateway", "running");
-      onboardSession.markStepComplete("gateway");
-    } else if (!resume && canReuseHealthyGateway) {
-      skippedStepMessage("gateway", "running", "reuse");
-      note("  Reusing healthy NemoClaw gateway.");
-      onboardSession.markStepComplete("gateway");
-    } else {
-      if (resume && session?.steps?.gateway?.status === "complete") {
-        if (gatewayReuseState === "active-unnamed") {
-          note("  [resume] Gateway is active but named metadata is missing; recreating it safely.");
-        } else if (gatewayReuseState === "foreign-active") {
-          note("  [resume] A different OpenShell gateway is active; NemoClaw will not reuse it.");
-        } else if (gatewayReuseState === "stale") {
-          note("  [resume] Recorded gateway is unhealthy; recreating it.");
-        } else {
-          note("  [resume] Recorded gateway state is unavailable; recreating it.");
-        }
-      }
-      if (isLinuxDockerDriverGatewayEnabled() && gatewayReuseState !== "missing") {
-        note("  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.");
-        retireLegacyGatewayForDockerDriverUpgrade();
-        gatewayReuseState = "missing";
-      }
-      startRecordedStep("gateway");
-      await startGateway(gpu, { gpuPassthrough });
-      onboardSession.markStepComplete("gateway");
-    }
+    session = gatewayResult.session;
 
     // #2753: prefer requestedSandboxName over an unconfirmed session name.
     // A pre-fix session may carry sandboxName even though sandbox creation
@@ -9526,531 +9382,218 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
       console.error("  Start a fresh onboard with --name <sandbox> to choose a different name.");
       process.exit(1);
     }
-    let model = session?.model || null;
-    let provider = session?.provider || null;
-    let endpointUrl = session?.endpointUrl || null;
-    let credentialEnv = session?.credentialEnv || null;
-    let hermesAuthMethod: HermesAuthMethod | null =
-      normalizeHermesAuthMethod(session?.hermesAuthMethod) ||
-      (provider === hermesProviderAuth.HERMES_PROVIDER_NAME &&
-      session?.credentialEnv === HERMES_NOUS_API_KEY_CREDENTIAL_ENV
-        ? HERMES_AUTH_METHOD_API_KEY
-        : null);
-    let hermesToolGateways = normalizeHermesToolGatewaySelections(session?.hermesToolGateways);
-    let preferredInferenceApi = session?.preferredInferenceApi || null;
-    let nimContainer = session?.nimContainer || null;
-    let webSearchConfig = session?.webSearchConfig || null;
-    let forceProviderSelection = forceProviderSelectionForAgentChange;
-    while (true) {
-      const resumeProviderSelection =
-        !forceProviderSelection &&
-        resume &&
-        session?.steps?.provider_selection?.status === "complete" &&
-        typeof provider === "string" &&
-        typeof model === "string";
-      if (resumeProviderSelection) {
-        skippedStepMessage("provider_selection", `${provider} / ${model}`);
-        hydrateCredentialEnv(credentialEnv);
-        // #3342: resume short-circuits provider selection — repair the
-        // ollama-local systemd loopback override here so legacy 0.0.0.0
-        // drop-ins from older NemoClaw versions get rewritten every resume.
-        repairLocalInferenceSystemdOverrideOrExit(provider, isNonInteractive);
-      } else {
-        // #2753: do not persist sandboxName to onboard-session.json before
-        // the sandbox actually exists in the gateway (Step 6 markStepComplete
-        // below). A SIGINT between any earlier step and createSandbox would
-        // otherwise leave a phantom that `nemoclaw list` resurrects until
-        // manually destroyed.
-        startRecordedStep("provider_selection");
-        const selection = await setupNim(gpu, sandboxName, agent);
-        model = selection.model;
-        provider = selection.provider;
-        endpointUrl = selection.endpointUrl;
-        credentialEnv = selection.credentialEnv;
-        hermesAuthMethod = selection.hermesAuthMethod;
-        hermesToolGateways = selection.hermesToolGateways;
-        preferredInferenceApi = selection.preferredInferenceApi;
-        nimContainer = selection.nimContainer;
-        onboardSession.markStepComplete(
-          "provider_selection",
-          toSessionUpdates({
-            provider,
-            model,
-            endpointUrl,
-            credentialEnv,
-            hermesAuthMethod,
-            hermesToolGateways,
-            preferredInferenceApi,
-            nimContainer,
-          }),
-        );
-      }
-
-      if (typeof provider !== "string" || typeof model !== "string") {
-        console.error("  Inference selection did not yield a provider/model.");
-        process.exit(1);
-      }
-      process.env.NEMOCLAW_OPENSHELL_BIN = getOpenshellBinary();
-      const needsBedrockRuntimeAdapter =
-        provider === "compatible-anthropic-endpoint" &&
-        bedrockRuntimeOnboard.needsBedrockRuntimeAdapter(endpointUrl);
-      const resumeInference =
-        !needsBedrockRuntimeAdapter &&
-        !forceProviderSelection &&
-        resume &&
-        isInferenceRouteReady(provider, model);
-      if (resumeInference) {
-        if (provider === hermesProviderAuth.HERMES_PROVIDER_NAME) {
-          if (!sandboxName) {
-            sandboxName = await promptValidatedSandboxName(agent);
-          }
-          startRecordedStep("inference", { provider, model });
-          const inferenceResult = await setupInference(
-            sandboxName,
-            model,
-            provider,
-            endpointUrl,
-            credentialEnv,
-            hermesAuthMethod,
-            hermesToolGateways,
-          );
-          if (inferenceResult?.retry === "selection") {
-            forceProviderSelection = true;
-            continue;
-          }
-          onboardSession.markStepComplete(
-            "inference",
-            toSessionUpdates({ provider, model, hermesAuthMethod, nimContainer, hermesToolGateways }),
-          );
-          break;
-        }
-        if (isRoutedInferenceProvider(provider)) {
-          try {
-            await reconcileModelRouter();
-          } catch (err) {
-            console.error(
-              `  ✗ Failed to reconcile model router: ${err instanceof Error ? err.message : String(err)}`,
-            );
-            process.exit(1);
-          }
-        }
-        skippedStepMessage("inference", `${provider} / ${model}`);
-        if (nimContainer && sandboxName) {
-          registry.updateSandbox(sandboxName, { nimContainer });
-        }
-        onboardSession.markStepComplete(
-          "inference",
-          toSessionUpdates({ provider, model, hermesAuthMethod, nimContainer, hermesToolGateways }),
-        );
-        break;
-      }
-
-      if (!sandboxName) {
-        sandboxName = await promptValidatedSandboxName(agent);
-      }
-      const buildEstimateNote =
-        process.env.NEMOCLAW_IGNORE_RUNTIME_RESOURCES === "1"
-          ? null
-          : formatSandboxBuildEstimateNote(assessHost());
-      console.log(
-        formatOnboardConfigSummary({
-          provider,
-          model,
-          credentialEnv,
-          hermesAuthMethod,
-          webSearchConfig,
-          hermesToolGateways,
-          enabledChannels: selectedMessagingChannels.length > 0 ? selectedMessagingChannels : null,
-          sandboxName,
-          notes: buildEstimateNote ? [buildEstimateNote] : [],
-        }),
-      );
-      console.log("  Web search and messaging channels will be prompted next.");
-      if (!isNonInteractive()) {
-        if (!(await promptYesNoOrDefault("  Apply this configuration?", null, true))) {
-          console.log(`  Aborted. Re-run \`${cliName()} onboard\` to start over.`);
-          console.log("  Credentials entered so far were only staged in memory for this run.");
-          console.log(
-            "  No new gateway credential was registered because onboarding stopped here.",
-          );
-          process.exit(0);
-        }
-      }
-
-      startRecordedStep("inference", { provider, model });
-      const inferenceResult = await setupInference(
-        sandboxName,
-        model,
-        provider,
-        endpointUrl,
-        credentialEnv,
-        hermesAuthMethod,
-        hermesToolGateways,
-      );
-      delete process.env.NVIDIA_API_KEY;
-      if (inferenceResult?.retry === "selection") {
-        forceProviderSelection = true;
-        continue;
-      }
-      if (nimContainer && sandboxName) {
-        registry.updateSandbox(sandboxName, { nimContainer });
-      }
-      onboardSession.markStepComplete(
-        "inference",
-        toSessionUpdates({ provider, model, hermesAuthMethod, nimContainer, hermesToolGateways }),
-      );
-      break;
-    }
-
-    const webSearchSupportProbePath = fromDockerfile ? path.resolve(fromDockerfile) : null;
-    const webSearchSupported = agentSupportsWebSearch(agent, webSearchSupportProbePath, ROOT);
-    if (webSearchConfig && !webSearchSupported) {
-      note(
-        `  Web search is not yet supported by ${agent?.displayName ?? "this sandbox image"}. Clearing stale config.`,
-      );
-      webSearchConfig = null;
-      if (session) {
-        session.webSearchConfig = null;
-      }
-      onboardSession.updateSession((current: Session) => {
-        current.webSearchConfig = null;
-        return current;
-      });
-    }
-
-    const storedMessagingChannelConfig = getStoredMessagingChannelConfig(sandboxName, session);
-    const effectiveMessagingChannelConfig = hydrateMessagingChannelConfig(storedMessagingChannelConfig);
-    const messagingChannelConfigChanged = !messagingChannelConfigsEqual(
-      effectiveMessagingChannelConfig,
-      storedMessagingChannelConfig,
-    );
-    if (effectiveMessagingChannelConfig) {
-      persistMessagingChannelConfigToSession(effectiveMessagingChannelConfig);
-      if (session) {
-        session.messagingChannelConfig = effectiveMessagingChannelConfig;
-      }
-    }
-
-    const sandboxReuseState = getSandboxReuseState(sandboxName);
-    const webSearchConfigChanged = Boolean(session?.webSearchConfig) !== Boolean(webSearchConfig);
-    // Telegram mention-mode is baked into openclaw.json at sandbox build time, so
-    // changes to TELEGRAM_REQUIRE_MENTION only take effect after a rebuild. Treat
-    // a mismatch between the recorded config and the current env value as drift
-    // so the reuse path forces a recreate (mirrors webSearchConfigChanged). See
-    // #1737 and the CodeRabbit review on #2417.
-    //
-    // Compare *effective* modes — null and false both produce groupPolicy: open
-    // at config-generation time (default behavior), so they collapse to the same
-    // bucket here. Without this, a sandbox built before TELEGRAM_REQUIRE_MENTION
-    // existed (recordedTelegramRequireMention === null) would be reused with the
-    // old groupPolicy: open even after the user sets TELEGRAM_REQUIRE_MENTION=1,
-    // and vice versa.
-    const currentTelegramRequireMention = computeTelegramRequireMention();
-    const recordedTelegramRequireMention = session?.telegramConfig?.requireMention ?? null;
-    const effectiveCurrent = currentTelegramRequireMention ?? false;
-    const effectiveRecorded = recordedTelegramRequireMention ?? false;
-    const telegramConfigChanged = effectiveCurrent !== effectiveRecorded;
-    const sandboxGpuConfigChanged = sandboxName
-      ? hasSandboxGpuDrift(sandboxName, sandboxGpuConfig)
-      : false;
-    const wechatConfigChanged = hasWechatConfigDrift(session);
-    const recordedHermesToolGateways = sandboxName
-      ? normalizeHermesToolGatewaySelections(registry.getSandbox(sandboxName)?.hermesToolGateways)
-      : [];
-    const hermesToolGatewayConfigChanged = !stringSetsEqual(
-      recordedHermesToolGateways,
-      hermesToolGateways,
-    );
-    const resumeSandbox =
-      resume &&
-      !resumeAgentChanged &&
-      !webSearchConfigChanged &&
-      !telegramConfigChanged &&
-      !sandboxGpuConfigChanged &&
-      !wechatConfigChanged &&
-      !messagingChannelConfigChanged &&
-      !hermesToolGatewayConfigChanged &&
-      session?.steps?.sandbox?.status === "complete" &&
-      sandboxReuseState === "ready";
-    if (resumeSandbox) {
-      if (webSearchConfig) {
-        note("  [resume] Reusing Brave Search configuration already baked into the sandbox.");
-      }
-      selectedMessagingChannels = session?.messagingChannels ?? [];
-      skippedStepMessage("sandbox", sandboxName);
-    } else {
-      if (resume && session?.steps?.sandbox?.status === "complete") {
-        if (resumeAgentChanged) {
-          note(
-            "  [resume] Agent selection changed; revalidating sandbox compatibility.",
-          );
-        } else if (webSearchConfigChanged) {
-          note("  [resume] Web Search configuration changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (telegramConfigChanged) {
-          note("  [resume] TELEGRAM_REQUIRE_MENTION changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (sandboxGpuConfigChanged) {
-          note("  [resume] Sandbox GPU settings changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (wechatConfigChanged) {
-          note("  [resume] WeChat account metadata changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (messagingChannelConfigChanged) {
-          note("  [resume] Messaging channel configuration changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (hermesToolGatewayConfigChanged) {
-          note("  [resume] Hermes managed tool gateway selection changed; recreating sandbox.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        } else if (sandboxReuseState === "not_ready") {
-          note(
-            `  [resume] Recorded sandbox '${sandboxName}' exists but is not ready; recreating it.`,
-          );
-          repairRecordedSandbox(sandboxName);
-        } else {
-          note("  [resume] Recorded sandbox state is unavailable; recreating it.");
-          if (sandboxName) {
-            registry.removeSandbox(sandboxName);
-          }
-        }
-      }
-      let nextWebSearchConfig = webSearchConfig;
-      if (nextWebSearchConfig) {
-        note("  [resume] Revalidating Brave Search configuration for sandbox recreation.");
-        const braveApiKey = await ensureValidatedBraveSearchCredential();
-        nextWebSearchConfig = braveApiKey ? { fetchEnabled: true } : null;
-        if (nextWebSearchConfig) {
-          note("  [resume] Reusing Brave Search configuration.");
-        }
-      } else {
-        nextWebSearchConfig = await configureWebSearch(null, agent, webSearchSupportProbePath);
-      }
-      startRecordedStep("sandbox", { provider, model });
-      const recordedMessagingChannels = getRecordedMessagingChannelsForResume(resume, session, sandboxName);
-      if (recordedMessagingChannels) {
-        selectedMessagingChannels = recordedMessagingChannels;
-        if (selectedMessagingChannels.length > 0) {
-          note(
-            `  [non-interactive] Reusing messaging channel configuration: ${selectedMessagingChannels.join(", ")}`,
-          );
-        }
-      } else {
-        const existing = sandboxName
-          ? registry.getSandbox(sandboxName)?.messagingChannels ??
-            session?.messagingChannels ??
-            null
-          : session?.messagingChannels ?? null;
-        selectedMessagingChannels = await setupMessagingChannels(agent, existing);
-      }
-      const messagingChannelConfig = readMessagingChannelConfigFromEnv();
-      onboardSession.updateSession((current: Session) => {
-        current.messagingChannels = selectedMessagingChannels;
-        current.messagingChannelConfig = messagingChannelConfig;
-        return current;
-      });
-      if (!sandboxName) {
-        sandboxName = await promptValidatedSandboxName(agent);
-      }
-      if (typeof model !== "string" || typeof provider !== "string") {
-        console.error("  Inference selection is incomplete; cannot create sandbox.");
-        process.exit(1);
-      }
-      if (fresh) {
-        stopStaleDashboardListenersForSandbox(registry.listSandboxes().sandboxes, sandboxName);
-      }
-      sandboxName = await createSandbox(
-        gpu,
-        model,
-        provider,
-        preferredInferenceApi,
-        sandboxName,
-        nextWebSearchConfig,
-        selectedMessagingChannels,
-        fromDockerfile,
-        agent,
-        opts.controlUiPort || null,
-        sandboxGpuConfig,
-        hermesToolGateways,
-      );
-      webSearchConfig = nextWebSearchConfig;
-      registry.updateSandbox(sandboxName, {
-        model,
-        provider,
-        ...getSandboxAgentRegistryFields(agent, !fromDockerfile),
-      });
-      registry.setDefault(sandboxName);
-      onboardSession.markStepComplete(
-        "sandbox",
-        toSessionUpdates({
-          sandboxName,
-          provider,
-          model,
-          nimContainer,
-          webSearchConfig,
-          messagingChannelConfig,
-          hermesToolGateways,
-        }),
-      );
-    }
-
-    if (
-      typeof sandboxName !== "string" ||
-      typeof provider !== "string" ||
-      typeof model !== "string"
-    ) {
-      console.error("  Onboarding state is incomplete after sandbox setup.");
-      process.exit(1);
-    }
-
-    if (agent) {
-      await agentOnboard.handleAgentSetup(sandboxName, model, provider, agent, resume, session, {
-        step,
-        runCaptureOpenshell,
-        openshellShellCommand,
-        openshellBinary: getOpenshellBinary(),
-        buildSandboxConfigSyncScript,
-        writeSandboxConfigSyncFile,
-        cleanupTempDir,
+    const providerInferenceResult = await handleProviderInferenceState({
+      resume,
+      session,
+      gpu,
+      sandboxName,
+      agent,
+      forceProviderSelection: forceProviderSelectionForAgentChange,
+      initial: {
+        model: session?.model || null,
+        provider: session?.provider || null,
+        endpointUrl: session?.endpointUrl || null,
+        credentialEnv: session?.credentialEnv || null,
+        hermesAuthMethod: session?.hermesAuthMethod || null,
+        hermesToolGateways: normalizeHermesToolGatewaySelections(session?.hermesToolGateways),
+        preferredInferenceApi: session?.preferredInferenceApi || null,
+        nimContainer: session?.nimContainer || null,
+        webSearchConfig: session?.webSearchConfig || null,
+      },
+      selectedMessagingChannels,
+      env: process.env,
+      constants: {
+        hermesProviderName: hermesProviderAuth.HERMES_PROVIDER_NAME,
+        hermesApiKeyAuthMethod: HERMES_AUTH_METHOD_API_KEY,
+        hermesApiKeyCredentialEnv: HERMES_NOUS_API_KEY_CREDENTIAL_ENV,
+      },
+      deps: {
+        normalizeHermesAuthMethod,
+        setupNim,
+        setupInference,
         startRecordedStep,
+        recordStepComplete,
+        toSessionUpdates: (updates) => toSessionUpdates(updates as Parameters<typeof toSessionUpdates>[0]),
         skippedStepMessage,
-      });
-      ensureAgentDashboardForward(sandboxName, agent);
-      onboardSession.markStepSkipped("openclaw");
-    } else {
-      const resumeOpenclaw = resume && sandboxName && isOpenclawReady(sandboxName);
-      if (resumeOpenclaw) {
-        skippedStepMessage("openclaw", sandboxName);
-        onboardSession.markStepComplete(
-          "openclaw",
-          toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
-        );
-      } else {
-        startRecordedStep("openclaw", { sandboxName, provider, model });
-        await setupOpenclaw(sandboxName, model, provider);
-        onboardSession.markStepComplete(
-          "openclaw",
-          toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
-        );
-      }
-      onboardSession.markStepSkipped("agent_setup");
-    }
+        ensureResumeProviderReady,
+        hydrateCredentialEnv,
+        repairLocalInferenceSystemdOverrideOrExit,
+        isNonInteractive,
+        getOpenshellBinary,
+        needsBedrockRuntimeAdapter: (providerName, url) =>
+          providerName === "compatible-anthropic-endpoint" &&
+          bedrockRuntimeOnboard.needsBedrockRuntimeAdapter(url),
+        isInferenceRouteReady,
+        isRoutedInferenceProvider,
+        reconcileModelRouter,
+        registryUpdateSandbox: (name, updates) => registry.updateSandbox(name, updates),
+        promptValidatedSandboxName,
+        assessHost,
+        formatSandboxBuildEstimateNote,
+        formatOnboardConfigSummary,
+        promptYesNoOrDefault,
+        cliName,
+        log: (message) => console.log(message),
+        error: (message) => console.error(message),
+        exitProcess: (code) => process.exit(code),
+        deleteEnv: (name) => {
+          delete process.env[name];
+        },
+      },
+    });
+    session = providerInferenceResult.session;
+    sandboxName = providerInferenceResult.sandboxName;
+    const {
+      model,
+      provider,
+      endpointUrl,
+      credentialEnv,
+      hermesAuthMethod,
+      hermesToolGateways,
+      preferredInferenceApi,
+      nimContainer,
+    } = providerInferenceResult;
+    let webSearchConfig = providerInferenceResult.webSearchConfig;
 
-    const latestSession = onboardSession.loadSession();
-    const recordedPolicyPresets = Array.isArray(latestSession?.policyPresets)
-      ? latestSession.policyPresets
-      : null;
-    const recordedMessagingChannels = Array.isArray(latestSession?.messagingChannels)
-      ? latestSession.messagingChannels
-      : [];
-    const activeMessagingChannels = registry.getSandbox(sandboxName)?.messagingChannels;
-    verifyCompatibleEndpointSandboxSmoke({
+    const sandboxStateResult = await handleSandboxState({
+      resume,
+      fresh,
+      resumeAgentChanged,
+      session,
+      sandboxName,
+      model,
+      provider,
+      nimContainer,
+      webSearchConfig,
+      selectedMessagingChannels,
+      fromDockerfile,
+      agent,
+      gpu,
+      preferredInferenceApi,
+      sandboxGpuConfig,
+      hermesToolGateways,
+      controlUiPort: opts.controlUiPort || null,
+      rootDir: ROOT,
+      deps: {
+        resolvePath: path.resolve,
+        agentSupportsWebSearch,
+        note,
+        updateSession: onboardSession.updateSession,
+        getStoredMessagingChannelConfig,
+        hydrateMessagingChannelConfig,
+        messagingChannelConfigsEqual,
+        persistMessagingChannelConfigToSession,
+        getSandboxReuseState,
+        computeTelegramRequireMention,
+        hasSandboxGpuDrift,
+        hasWechatConfigDrift,
+        getSandboxHermesToolGateways: (name) => registry.getSandbox(name)?.hermesToolGateways,
+        normalizeHermesToolGatewaySelections,
+        stringSetsEqual,
+        removeSandboxFromRegistry: registry.removeSandbox.bind(registry),
+        repairRecordedSandbox,
+        ensureValidatedBraveSearchCredential,
+        isBackToSelection,
+        configureWebSearch,
+        startRecordedStep,
+        getRecordedMessagingChannelsForResume,
+        getSandboxMessagingChannels: (name) => registry.getSandbox(name)?.messagingChannels,
+        setupMessagingChannels,
+        readMessagingChannelConfigFromEnv,
+        promptValidatedSandboxName,
+        stopStaleDashboardListenersForSandbox,
+        listRegistrySandboxes: registry.listSandboxes,
+        createSandbox,
+        updateSandboxRegistry: (name, updates) => registry.updateSandbox(name, updates),
+        setDefaultSandbox: registry.setDefault,
+        getSandboxAgentRegistryFields,
+        recordStepComplete,
+        toSessionUpdates: (updates) => toSessionUpdates(updates as Parameters<typeof toSessionUpdates>[0]),
+        skippedStepMessage,
+        error: (message) => console.error(message),
+        exitProcess: (code) => process.exit(code),
+      },
+    });
+    session = sandboxStateResult.session;
+    sandboxName = sandboxStateResult.sandboxName;
+    webSearchConfig = sandboxStateResult.webSearchConfig ?? null;
+    selectedMessagingChannels = sandboxStateResult.selectedMessagingChannels;
+    const webSearchSupported = sandboxStateResult.webSearchSupported;
+
+    const agentSetupResult = await handleAgentSetupState({
+      agent,
+      sandboxName,
+      model,
+      provider,
+      resume,
+      session,
+      hermesAuthMethod,
+      hermesToolGateways,
+      deps: {
+        handleAgentSetup: agentOnboard.handleAgentSetup,
+        agentSetupContext: () => ({
+          step,
+          runCaptureOpenshell,
+          openshellShellCommand,
+          openshellBinary: getOpenshellBinary(),
+          startRecordedStep,
+          recordStepComplete,
+          recordStepFailed,
+          skippedStepMessage,
+        }),
+        ensureAgentDashboardForward,
+        recordStepSkipped,
+        isOpenclawReady,
+        skippedStepMessage,
+        startRecordedStep,
+        setupOpenclaw,
+        syncNemoClawConfigInSandbox,
+        recordStepComplete,
+        toSessionUpdates: (updates) => toSessionUpdates(updates as Parameters<typeof toSessionUpdates>[0]),
+      },
+    });
+    session = agentSetupResult.session;
+
+    const policiesResult = await handlePoliciesState({
+      resume,
       sandboxName,
       provider,
       model,
-      runOpenshell,
-      redact,
       endpointUrl,
       credentialEnv,
-      messagingChannels: Array.isArray(activeMessagingChannels) ? activeMessagingChannels : [],
+      selectedMessagingChannels,
+      webSearchConfig,
+      webSearchSupported,
+      hermesToolGateways,
       agent,
+      deps: {
+        loadSession: onboardSession.loadSession,
+        getActiveSandbox: (name) => registry.getSandbox(name),
+        mergePolicyMessagingChannels,
+        verifyCompatibleEndpointSandboxSmoke: (options) =>
+          verifyCompatibleEndpointSandboxSmoke({
+            ...options,
+            runOpenshell,
+            redact,
+          }),
+        preparePolicyPresetResumeSelection: (name, options) =>
+          preparePolicyPresetResumeSelection({ policies }, name, options),
+        arePolicyPresetsApplied,
+        skippedStepMessage,
+        startRecordedStep,
+        setupPoliciesWithSelection,
+        updateSession: onboardSession.updateSession,
+        recordStepComplete,
+        toSessionUpdates: (updates) => toSessionUpdates(updates as Parameters<typeof toSessionUpdates>[0]),
+      },
     });
-    const policyPresetSupportOptions = { webSearchSupported };
-    const selectablePolicyPresetsForSupport = [
-      ...policies.listSetupPolicyPresets(sandboxName, policyPresetSupportOptions),
-      ...policies.getAppliedPresets(sandboxName).map((name) => ({ name })),
-    ];
-    const customPolicyPresetNames = new Set(
-      policies.listCustomPresets(sandboxName).map((p: { name: string }) => p.name),
-    );
-    let recordedPolicyPresetsForSupport = policies.clampSetupPolicyPresetNames(
-      recordedPolicyPresets || [],
-      selectablePolicyPresetsForSupport,
-      policyPresetSupportOptions,
-      customPolicyPresetNames,
-    );
-    recordedPolicyPresetsForSupport = recordedPolicyPresetsForSupport.filter(
-      (name) =>
-        !isStaleBuiltinBravePolicyPreset(name, {
-          webSearchConfig,
-          customPresetNames: customPolicyPresetNames,
-        }),
-    );
-    if (recordedPolicyPresets) {
-      recordedPolicyPresetsForSupport = mergeRequiredHermesToolGatewayPolicyPresets(
-        recordedPolicyPresetsForSupport,
-        hermesToolGateways,
-        selectablePolicyPresetsForSupport.map((p) => p.name),
-      );
-    }
-    const recordedPolicyPresetsHaveUnsupported =
-      Array.isArray(recordedPolicyPresets) &&
-      recordedPolicyPresetsForSupport.length !== recordedPolicyPresets.length;
-    const resumePolicies =
-      resume &&
-      sandboxName &&
-      !recordedPolicyPresetsHaveUnsupported &&
-      arePolicyPresetsApplied(sandboxName, recordedPolicyPresetsForSupport);
-    if (resumePolicies) {
-      skippedStepMessage("policies", recordedPolicyPresetsForSupport.join(", "));
-      onboardSession.markStepComplete(
-        "policies",
-        toSessionUpdates({
-          sandboxName,
-          provider,
-          model,
-          policyPresets: recordedPolicyPresetsForSupport,
-        }),
-      );
-    } else {
-      startRecordedStep("policies", {
-        sandboxName,
-        provider,
-        model,
-        policyPresets: recordedPolicyPresetsForSupport,
-      });
-      const appliedPolicyPresets = await setupPoliciesWithSelection(sandboxName, {
-        selectedPresets:
-          Array.isArray(recordedPolicyPresets)
-            ? recordedPolicyPresetsForSupport
-            : null,
-        enabledChannels:
-          selectedMessagingChannels.length > 0
-            ? selectedMessagingChannels
-            : recordedMessagingChannels,
-        webSearchConfig,
-        provider,
-        webSearchSupported,
-        hermesToolGateways,
-        onSelection: (policyPresets) => {
-          onboardSession.updateSession((current: Session) => {
-            current.policyPresets = policyPresets;
-            return current;
-          });
-        },
-      });
-      onboardSession.markStepComplete(
-        "policies",
-        toSessionUpdates({ sandboxName, provider, model, policyPresets: appliedPolicyPresets }),
-      );
-    }
+    session = policiesResult.session;
 
     if (agent) {
       ensureAgentDashboardForward(sandboxName, agent);
     }
 
-    onboardSession.completeSession(
+    await recordSessionComplete(
       toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
     );
     completed = true;
@@ -10130,6 +9673,7 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
     printDashboard(sandboxName, model, provider, nimContainer, agent);
   } finally {
     releaseOnboardLock();
+    onboardRuntimeBoundary.clear();
   }
 }
 
@@ -10212,7 +9756,6 @@ module.exports = {
   recoverGatewayRuntime,
   buildChain,
   buildControlUiUrls,
-
   startGateway,
   findAvailableDashboardPort,
   findDashboardForwardOwner,
@@ -10268,4 +9811,5 @@ module.exports = {
   checkTelegramReachability,
   TELEGRAM_NETWORK_CURL_CODES,
   verifyCompatibleEndpointSandboxSmoke,
+  resumeProviderShimDeps: { isRoutedInferenceProvider, replaceNamedCredential },
 };
