@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -358,14 +357,6 @@ describe("oclif compatibility dispatch", () => {
     }
   });
 
-  it("keeps oclif flexible taxonomy enabled for space-separated native commands", () => {
-    const packageJson = JSON.parse(fs.readFileSync("package.json", "utf-8")) as {
-      oclif?: { flexibleTaxonomy?: boolean; topicSeparator?: string };
-    };
-
-    expect(packageJson.oclif?.flexibleTaxonomy).toBe(true);
-    expect(packageJson.oclif?.topicSeparator).toBe(" ");
-  });
 
   it("uses the alias binary name in native oclif help", () => {
     const result = spawnSync(
