@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawn } from "node:child_process";
-
-import { ROOT } from "../../runner";
 import { getOpenshellBinary, runOpenshell } from "../../adapters/openshell/runtime";
+import type { SandboxLogsOptions } from "../../domain/sandbox/log-options";
 import {
   buildEnableSandboxAuditLogsArgs,
   buildSandboxLogsArgs,
@@ -12,26 +11,51 @@ import {
   describeLogProbeResult,
   exitCodeFromSignal,
   getLogsProbeTimeoutMs,
-  normalizeSandboxLogsOptions,
   type LogProbeResult,
+  mergeTailLogLines,
+  normalizeSandboxLogsOptions,
 } from "../../domain/sandbox/logs";
-import type { SandboxLogsOptions } from "../../domain/sandbox/log-options";
+import { ROOT } from "../../runner";
+import {
+  isDockerRuntimeDown,
+  printDockerRuntimeDownGuidance,
+} from "./gateway-failure-classifier";
 
-function exitWithSpawnResult(result: LogProbeResult) {
+type RunOpenshellOptions = Parameters<typeof runOpenshell>[1];
+type RunOpenshellFn = (args: string[], options?: RunOpenshellOptions) => LogProbeResult;
+type SpawnFn = typeof spawn;
+type ExitFn = (code: number) => never;
+
+export type SandboxLogsRuntimeDeps = {
+  env?: NodeJS.ProcessEnv;
+  exit?: ExitFn;
+  getOpenshellBinary?: typeof getOpenshellBinary;
+  isDockerRuntimeDown?: typeof isDockerRuntimeDown;
+  printDockerRuntimeDownGuidance?: typeof printDockerRuntimeDownGuidance;
+  runOpenshell?: RunOpenshellFn;
+  spawn?: SpawnFn;
+  writeStdout?: (chunk: string) => void;
+};
+
+function exitWithSpawnResult(result: LogProbeResult, deps: SandboxLogsRuntimeDeps) {
+  const exit = deps.exit ?? process.exit;
   if (result.status !== null) {
-    process.exit(result.status);
+    exit(result.status);
   }
 
-  process.exit(exitCodeFromSignal(result.signal ?? null));
+  exit(exitCodeFromSignal(result.signal ?? null));
 }
 
 function runOpenclawGatewayLogs(
   sandboxName: string,
   options: SandboxLogsOptions,
+  deps: SandboxLogsRuntimeDeps,
 ): LogProbeResult {
   const args = buildSandboxOpenclawGatewayLogsArgs(sandboxName, options);
-  const result = runOpenshell(args, {
-    stdio: "inherit",
+  // Capture stdout so the caller can merge with the OpenShell source
+  // (closes #4100). stderr still inherits so warnings print directly.
+  const result = (deps.runOpenshell ?? runOpenshell)(args, {
+    stdio: ["ignore", "pipe", "inherit"],
     ignoreError: true,
     timeout: getLogsProbeTimeoutMs(),
   });
@@ -44,14 +68,19 @@ function runOpenclawGatewayLogs(
   return result;
 }
 
-function streamSandboxFollowLogs(sandboxName: string, options: SandboxLogsOptions): void {
+function streamSandboxFollowLogs(
+  sandboxName: string,
+  options: SandboxLogsOptions,
+  deps: SandboxLogsRuntimeDeps,
+): void {
   const openclawArgs = options.since
     ? null
     : buildSandboxOpenclawGatewayLogsArgs(sandboxName, options);
   const openshellArgs = buildSandboxLogsArgs(sandboxName, options);
+  const exit = deps.exit ?? process.exit;
   const spawnOptions = {
     cwd: ROOT,
-    env: process.env,
+    env: deps.env ?? process.env,
     stdio: "inherit" as const,
   };
   const sources: Array<{
@@ -82,7 +111,7 @@ function streamSandboxFollowLogs(sandboxName: string, options: SandboxLogsOption
       clearTimeout(forcedExitTimer);
       forcedExitTimer = null;
     }
-    process.exit(requestedExitCode ?? finalStatus);
+    exit(requestedExitCode ?? finalStatus);
   };
   const markSourceDone = (
     source: (typeof sources)[number],
@@ -106,7 +135,7 @@ function streamSandboxFollowLogs(sandboxName: string, options: SandboxLogsOption
     exiting = true;
     requestedExitCode = exitCode;
     stopChildren(signal);
-    forcedExitTimer = setTimeout(() => process.exit(exitCode), 2000);
+    forcedExitTimer = setTimeout(() => exit(exitCode), 2000);
     forcedExitTimer.unref?.();
     maybeExit();
   };
@@ -119,10 +148,12 @@ function streamSandboxFollowLogs(sandboxName: string, options: SandboxLogsOption
   });
 
   const addSource = (label: string, args: string[]) => {
+    const spawnProcess = deps.spawn ?? spawn;
+    const openshellBinary = (deps.getOpenshellBinary ?? getOpenshellBinary)();
     const source = {
       label,
       args,
-      child: spawn(getOpenshellBinary(), args, spawnOptions),
+      child: spawnProcess(openshellBinary, args, spawnOptions),
       done: false,
     };
     sources.push(source);
@@ -137,15 +168,15 @@ function streamSandboxFollowLogs(sandboxName: string, options: SandboxLogsOption
   if (openclawArgs) {
     addSource("OpenClaw log source", openclawArgs);
   }
-  enableSandboxAuditLogs(sandboxName);
+  enableSandboxAuditLogs(sandboxName, deps);
   addSource("OpenShell log source", openshellArgs);
   setupComplete = true;
   maybeExit();
 }
 
-function enableSandboxAuditLogs(sandboxName: string) {
+function enableSandboxAuditLogs(sandboxName: string, deps: SandboxLogsRuntimeDeps) {
   const args = buildEnableSandboxAuditLogsArgs(sandboxName);
-  const result = runOpenshell(args, {
+  const result = (deps.runOpenshell ?? runOpenshell)(args, {
     stdio: ["ignore", "ignore", "pipe"],
     ignoreError: true,
     timeout: getLogsProbeTimeoutMs(),
@@ -172,23 +203,63 @@ function warnSandboxAuditLogsUnavailable(
 }
 
 export function showSandboxLogs(sandboxName: string, options: SandboxLogsOptions | boolean) {
+  showSandboxLogsWithDeps(sandboxName, options);
+}
+
+export function showSandboxLogsWithDeps(
+  sandboxName: string,
+  options: SandboxLogsOptions | boolean,
+  deps: SandboxLogsRuntimeDeps = {},
+) {
+  // Normalize/validate options before any host I/O so malformed flags still
+  // surface their own error rather than a Docker-outage message.
   const logsOptions = normalizeSandboxLogsOptions(options);
+
+  // Preflight the Docker daemon so a host runtime outage is named as such
+  // instead of surfacing as opaque "log source unavailable" failures from the
+  // underlying OpenShell commands (#4428).
+  if ((deps.isDockerRuntimeDown ?? isDockerRuntimeDown)(sandboxName)) {
+    (deps.printDockerRuntimeDownGuidance ?? printDockerRuntimeDownGuidance)(sandboxName, {
+      retryCommand: "logs",
+    });
+    (deps.exit ?? process.exit)(1);
+  }
+
   if (logsOptions.follow) {
-    streamSandboxFollowLogs(sandboxName, logsOptions);
+    streamSandboxFollowLogs(sandboxName, logsOptions, deps);
     return;
   }
 
-  enableSandboxAuditLogs(sandboxName);
+  enableSandboxAuditLogs(sandboxName, deps);
+
+  // Capture stdout from both sources so --tail N can be applied once
+  // to the merged stream rather than independently per source
+  // (which previously returned up to 2*N lines). Closes #4100.
+  let gatewayResult: LogProbeResult | null = null;
   if (!logsOptions.since) {
-    runOpenclawGatewayLogs(sandboxName, logsOptions);
+    gatewayResult = runOpenclawGatewayLogs(sandboxName, logsOptions, deps);
   }
-  const args = buildSandboxLogsArgs(sandboxName, logsOptions);
-  const result = runOpenshell(args, {
-    stdio: "inherit",
+
+  const openshellArgs = buildSandboxLogsArgs(sandboxName, logsOptions);
+  const openshellResult = (deps.runOpenshell ?? runOpenshell)(openshellArgs, {
+    stdio: ["ignore", "pipe", "inherit"],
     ignoreError: true,
   });
-  if (result.status !== 0) {
-    console.error(`  Command failed (exit ${result.status}): openshell ${args.join(" ")}`);
+
+  const targetLines = Number(logsOptions.lines);
+  const maxLines = Number.isFinite(targetLines) && targetLines > 0 ? targetLines : 0;
+  const sources: string[] = [];
+  if (gatewayResult?.stdout) sources.push(String(gatewayResult.stdout));
+  if (openshellResult.stdout) sources.push(String(openshellResult.stdout));
+  const merged = mergeTailLogLines(sources, maxLines);
+  if (merged) {
+    (deps.writeStdout ?? process.stdout.write.bind(process.stdout))(merged);
   }
-  exitWithSpawnResult(result);
+
+  if (openshellResult.status !== 0) {
+    console.error(
+      `  Command failed (exit ${openshellResult.status}): openshell ${openshellArgs.join(" ")}`,
+    );
+  }
+  exitWithSpawnResult(openshellResult, deps);
 }

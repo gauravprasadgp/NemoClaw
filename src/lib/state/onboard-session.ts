@@ -15,12 +15,24 @@ import { isErrnoException } from "../core/errno";
 import type { JsonObject, JsonValue } from "../core/json-types";
 import type { WebSearchConfig } from "../inference/web-search";
 import {
-  sanitizeMessagingChannelConfig,
   type MessagingChannelConfig,
+  sanitizeMessagingChannelConfig,
 } from "../messaging-channel-config";
+import type { SandboxMessagingPlan } from "../messaging/manifest";
+import { parseSandboxMessagingPlan } from "../onboard/messaging-plan-session";
+import {
+  createOnboardMachineEvent,
+  emitOnboardMachineEvent,
+  machineStateFromOnboardSessionStep,
+} from "../onboard/machine/events";
+import { isOnboardMachineState } from "../onboard/machine/transitions";
+import type { OnboardMachineState } from "../onboard/machine/types";
 import { redactSensitiveText, redactUrl } from "../security/redact";
+import { type StepMutationOptions, shouldUpdateMachine } from "./onboard-step-mutation";
+import { nextMachineStateAfterCompletedStep } from "./onboard-step-state";
 
 export const SESSION_VERSION = 1;
+export const MACHINE_SNAPSHOT_VERSION = 1;
 export const SESSION_DIR = path.join(process.env.HOME || "/tmp", ".nemoclaw");
 export const SESSION_FILE = path.join(SESSION_DIR, "onboard-session.json");
 export const LOCK_FILE = path.join(SESSION_DIR, "onboard.lock");
@@ -60,6 +72,13 @@ export interface SessionMetadata {
   fromDockerfile: string | null;
 }
 
+export interface OnboardMachineSnapshot {
+  version: typeof MACHINE_SNAPSHOT_VERSION;
+  state: OnboardMachineState;
+  stateEnteredAt: string | null;
+  revision: number;
+}
+
 export interface Session {
   version: number;
   sessionId: string;
@@ -83,9 +102,11 @@ export interface Session {
   routerPid: number | null;
   routerCredentialHash: string | null;
   webSearchConfig: WebSearchConfig | null;
+  hermesToolGateways: string[] | null;
   policyPresets: string[] | null;
   messagingChannels: string[] | null;
   messagingChannelConfig: MessagingChannelConfig | null;
+  messagingPlan: SandboxMessagingPlan | null;
   // Channels the operator paused via `nemoclaw <sb> channels stop <ch>`.
   // Mirrors `SandboxEntry.disabledChannels` so that `rebuild` — which
   // destroys the registry entry before calling `onboard --resume` —
@@ -110,6 +131,7 @@ export interface Session {
   telegramConfig: TelegramConfig | null;
   wechatConfig: WechatConfig | null;
   metadata: SessionMetadata;
+  machine: OnboardMachineSnapshot;
   steps: Record<string, StepState>;
 }
 
@@ -159,9 +181,11 @@ export interface SessionUpdates {
   routerPid?: number;
   routerCredentialHash?: string;
   webSearchConfig?: WebSearchConfig | null;
-  policyPresets?: string[];
-  messagingChannels?: string[];
+  hermesToolGateways?: string[] | null;
+  policyPresets?: string[] | null;
+  messagingChannels?: string[] | null;
   messagingChannelConfig?: MessagingChannelConfig | null;
+  messagingPlan?: SandboxMessagingPlan | null;
   disabledChannels?: string[] | null;
   migratedLegacyValueHashes?: Record<string, string>;
   gpuPassthrough?: boolean;
@@ -186,11 +210,13 @@ export interface DebugSessionSummary {
   hermesAuthMethod: HermesAuthMethod | null;
   preferredInferenceApi: string | null;
   nimContainer: string | null;
+  hermesToolGateways: string[] | null;
   policyPresets: string[] | null;
   gpuPassthrough: boolean;
   lastStepStarted: string | null;
   lastCompletedStep: string | null;
   failure: SessionFailure | null;
+  machine: OnboardMachineSnapshot;
   steps: Record<string, StepState>;
 }
 
@@ -231,6 +257,10 @@ function readHermesAuthMethod(value: SessionJsonValue | undefined): HermesAuthMe
 
 function readPositiveInteger(value: SessionJsonValue | undefined): number | null {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function readNonNegativeInteger(value: SessionJsonValue | undefined): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function readStringArray(value: SessionJsonValue | undefined): string[] | null {
@@ -301,6 +331,17 @@ function parseStepState(value: SessionJsonValue | undefined): StepState | null {
   };
 }
 
+function parseMachineSnapshot(value: SessionJsonValue | undefined): OnboardMachineSnapshot | null {
+  if (!isObject(value) || value.version !== MACHINE_SNAPSHOT_VERSION) return null;
+  if (!isOnboardMachineState(value.state)) return null;
+  return {
+    version: MACHINE_SNAPSHOT_VERSION,
+    state: value.state,
+    stateEnteredAt: readString(value.stateEnteredAt),
+    revision: readNonNegativeInteger(value.revision) ?? 0,
+  };
+}
+
 function parseLockInfo(value: SessionJsonValue | undefined): LockInfo | null {
   if (!isObject(value) || typeof value.pid !== "number") return null;
   return {
@@ -328,15 +369,79 @@ export function sanitizeFailure(
 
 // ── Session CRUD ─────────────────────────────────────────────────
 
+function createMachineSnapshot(
+  state: OnboardMachineState,
+  stateEnteredAt: string | null,
+  revision = 0,
+): OnboardMachineSnapshot {
+  return {
+    version: MACHINE_SNAPSHOT_VERSION,
+    state,
+    stateEnteredAt,
+    revision: Math.max(0, Math.trunc(revision)),
+  };
+}
+
+function inferMachineState(session: Session): OnboardMachineState {
+  if (session.status === "complete") return "complete";
+  if (session.status === "failed") return "failed";
+
+  const startedState = machineStateFromOnboardSessionStep(session.lastStepStarted);
+  const startedStep = session.lastStepStarted ? session.steps[session.lastStepStarted] : null;
+  if (startedState && startedStep?.status === "in_progress") return startedState;
+
+  return nextMachineStateAfterCompletedStep(session.lastCompletedStep, session) ?? "init";
+}
+
+function inferMachineStateEnteredAt(session: Session, state: OnboardMachineState): string | null {
+  if (state === "failed") return session.failure?.recordedAt ?? session.updatedAt;
+  if (state === "complete") return session.updatedAt;
+
+  const startedState = machineStateFromOnboardSessionStep(session.lastStepStarted);
+  const startedStep = session.lastStepStarted ? session.steps[session.lastStepStarted] : null;
+  if (state === startedState && startedStep?.status === "in_progress") {
+    return startedStep.startedAt ?? session.updatedAt;
+  }
+
+  if (nextMachineStateAfterCompletedStep(session.lastCompletedStep, session) === state) {
+    const completedStep = session.lastCompletedStep ? session.steps[session.lastCompletedStep] : null;
+    return completedStep?.completedAt ?? session.updatedAt;
+  }
+
+  return session.startedAt;
+}
+
+function inferMachineSnapshot(session: Session): OnboardMachineSnapshot {
+  const state = inferMachineState(session);
+  return createMachineSnapshot(state, inferMachineStateEnteredAt(session, state));
+}
+
+function transitionMachineSnapshot(session: Session, state: OnboardMachineState, now: string): void {
+  const current = session.machine ?? createMachineSnapshot("init", session.startedAt);
+  if (current.state === state) {
+    session.machine = {
+      ...current,
+      stateEnteredAt: current.stateEnteredAt ?? now,
+    };
+    return;
+  }
+  session.machine = createMachineSnapshot(state, now, current.revision + 1);
+}
+
 export function createSession(overrides: Partial<Session> = {}): Session {
   const now = new Date().toISOString();
-  return {
+  const startedAt = overrides.startedAt ?? now;
+  const steps = {
+    ...defaultSteps(),
+    ...(overrides.steps ?? {}),
+  };
+  const session: Session = {
     version: SESSION_VERSION,
     sessionId: overrides.sessionId ?? `${Date.now()}-${randomUUID()}`,
     resumable: true,
     status: "in_progress",
     mode: overrides.mode ?? "interactive",
-    startedAt: overrides.startedAt ?? now,
+    startedAt,
     updatedAt: overrides.updatedAt ?? now,
     lastStepStarted: overrides.lastStepStarted ?? null,
     lastCompletedStep: overrides.lastCompletedStep ?? null,
@@ -354,9 +459,11 @@ export function createSession(overrides: Partial<Session> = {}): Session {
     routerCredentialHash: overrides.routerCredentialHash ?? null,
     webSearchConfig:
       overrides.webSearchConfig?.fetchEnabled === true ? { fetchEnabled: true } : null,
+    hermesToolGateways: readStringArray(overrides.hermesToolGateways),
     policyPresets: readStringArray(overrides.policyPresets),
     messagingChannels: readStringArray(overrides.messagingChannels),
     messagingChannelConfig: sanitizeMessagingChannelConfig(overrides.messagingChannelConfig),
+    messagingPlan: parseSandboxMessagingPlan(overrides.messagingPlan),
     disabledChannels: readStringArray(overrides.disabledChannels),
     migratedLegacyValueHashes: overrides.migratedLegacyValueHashes
       ? readStringRecord(overrides.migratedLegacyValueHashes)
@@ -368,11 +475,11 @@ export function createSession(overrides: Partial<Session> = {}): Session {
       gatewayName: overrides.metadata?.gatewayName ?? "nemoclaw",
       fromDockerfile: overrides.metadata?.fromDockerfile ?? null,
     },
-    steps: {
-      ...defaultSteps(),
-      ...(overrides.steps ?? {}),
-    },
+    machine: parseMachineSnapshot(overrides.machine as SessionJsonValue | undefined) ??
+      createMachineSnapshot("init", startedAt),
+    steps,
   };
+  return session;
 }
 
 export function normalizeSession(data: Session | SessionJsonValue | undefined): Session | null {
@@ -395,9 +502,11 @@ export function normalizeSession(data: Session | SessionJsonValue | undefined): 
     routerPid: readPositiveInteger(data.routerPid),
     routerCredentialHash: readString(data.routerCredentialHash),
     webSearchConfig: parseWebSearchConfig(data.webSearchConfig),
+    hermesToolGateways: readStringArray(data.hermesToolGateways),
     policyPresets: readStringArray(data.policyPresets),
     messagingChannels: readStringArray(data.messagingChannels),
     messagingChannelConfig: sanitizeMessagingChannelConfig(data.messagingChannelConfig),
+    messagingPlan: parseSandboxMessagingPlan(data.messagingPlan),
     disabledChannels: readStringArray(data.disabledChannels),
     migratedLegacyValueHashes: readStringRecord(data.migratedLegacyValueHashes),
     gpuPassthrough: data.gpuPassthrough === true,
@@ -419,6 +528,8 @@ export function normalizeSession(data: Session | SessionJsonValue | undefined): 
       }
     }
   }
+
+  normalized.machine = parseMachineSnapshot(data.machine) ?? inferMachineSnapshot(normalized);
 
   return normalized;
 }
@@ -465,6 +576,29 @@ function parseLockFile(contents: string): LockInfo | null {
     return parseLockInfo(JSON.parse(contents));
   } catch {
     return null;
+  }
+}
+
+interface LockFileSnapshot {
+  info: LockInfo | null;
+  inode: bigint;
+  mtimeMs: number;
+}
+
+function readLockFileSnapshot(): LockFileSnapshot {
+  const fd = fs.openSync(LOCK_FILE, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isFile()) {
+      return { info: null, inode: stat.ino, mtimeMs: Number(stat.mtimeMs) };
+    }
+    return {
+      info: parseLockFile(String(fs.readFileSync(fd, "utf8"))),
+      inode: stat.ino,
+      mtimeMs: Number(stat.mtimeMs),
+    };
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -569,34 +703,25 @@ export function acquireOnboardLock(command: string | null = null): LockResult {
       // the same stale lock, and the slower one will unlink the fresh
       // lock the faster one just claimed, breaking mutual exclusion.
       // See issue #1281.
-      let existing: LockInfo | null;
-      let staleInode: bigint | null;
+      let snapshot: LockFileSnapshot;
       try {
-        const stat = fs.statSync(LOCK_FILE, { bigint: true });
-        staleInode = stat.ino;
-        existing = parseLockFile(fs.readFileSync(LOCK_FILE, "utf8"));
+        snapshot = readLockFileSnapshot();
       } catch (readError) {
         if (isErrnoException(readError) && readError.code === "ENOENT") {
           continue;
         }
         throw readError;
       }
+      const { info: existing, inode: staleInode } = snapshot;
       if (!existing) {
         // Malformed lock file. If the file is very recent (<30 s), a
         // concurrent process may be mid-write — leave it and retry.
         // Otherwise the file is stale debris from a crash between
         // openSync("wx") and writeSync() — remove it so subsequent
         // onboard runs are not permanently blocked (#2765).
-        try {
-          const lockStat = fs.statSync(LOCK_FILE);
-          const ageMs = Date.now() - lockStat.mtimeMs;
-          if (ageMs > MALFORMED_STALE_SECONDS * 1000) {
-            unlinkIfInodeMatches(LOCK_FILE, staleInode);
-          }
-        } catch (statErr) {
-          if (!(isErrnoException(statErr) && statErr.code === "ENOENT")) {
-            throw statErr;
-          }
+        const ageMs = Date.now() - snapshot.mtimeMs;
+        if (ageMs > MALFORMED_STALE_SECONDS * 1000) {
+          unlinkIfInodeMatches(LOCK_FILE, staleInode);
         }
         continue;
       }
@@ -727,17 +852,16 @@ export function releaseOnboardLock(): void {
   // behavior so we never unlink a malformed lock and never unlink a
   // lock owned by another pid.
   try {
-    if (!fs.existsSync(LOCK_FILE)) return;
-    let existing: LockInfo | null = null;
+    let snapshot: LockFileSnapshot;
     try {
-      existing = parseLockFile(fs.readFileSync(LOCK_FILE, "utf8"));
+      snapshot = readLockFileSnapshot();
     } catch (error) {
       if (isErrnoException(error) && error.code === "ENOENT") return;
       throw error;
     }
-    if (!existing) return;
-    if (existing.pid !== process.pid) return;
-    fs.unlinkSync(LOCK_FILE);
+    if (!snapshot.info) return;
+    if (snapshot.info.pid !== process.pid) return;
+    unlinkIfInodeMatches(LOCK_FILE, snapshot.inode);
   } catch {
     return;
   }
@@ -808,10 +932,21 @@ export function filterSafeUpdates(updates: SessionUpdates): Partial<Session> {
   } else if (updates.webSearchConfig === null) {
     safe.webSearchConfig = null;
   }
-  if (Array.isArray(updates.policyPresets)) {
+  if (updates.hermesToolGateways === null) {
+    safe.hermesToolGateways = null;
+  } else if (Array.isArray(updates.hermesToolGateways)) {
+    safe.hermesToolGateways = updates.hermesToolGateways.filter(
+      (value) => typeof value === "string",
+    );
+  }
+  if (updates.policyPresets === null) {
+    safe.policyPresets = null;
+  } else if (Array.isArray(updates.policyPresets)) {
     safe.policyPresets = updates.policyPresets.filter((value) => typeof value === "string");
   }
-  if (Array.isArray(updates.messagingChannels)) {
+  if (updates.messagingChannels === null) {
+    safe.messagingChannels = null;
+  } else if (Array.isArray(updates.messagingChannels)) {
     safe.messagingChannels = updates.messagingChannels.filter((value) => typeof value === "string");
   }
   if (updates.messagingChannelConfig === null) {
@@ -819,6 +954,12 @@ export function filterSafeUpdates(updates: SessionUpdates): Partial<Session> {
   } else {
     const messagingChannelConfig = sanitizeMessagingChannelConfig(updates.messagingChannelConfig);
     if (messagingChannelConfig) safe.messagingChannelConfig = messagingChannelConfig;
+  }
+  if (updates.messagingPlan === null) {
+    safe.messagingPlan = null;
+  } else {
+    const messagingPlan = parseSandboxMessagingPlan(updates.messagingPlan);
+    if (messagingPlan) safe.messagingPlan = messagingPlan;
   }
   if (updates.disabledChannels === null) {
     safe.disabledChannels = null;
@@ -866,73 +1007,194 @@ export function updateSession(mutator: (session: Session) => Session | void): Se
   return saveSession(next);
 }
 
-export function markStepStarted(stepName: string): Session {
-  return updateSession((session) => {
+function markStepStartedWithOptions(stepName: string, options: StepMutationOptions = {}): Session {
+  let shouldEmit = false;
+  const updatedSession = updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
+    const now = new Date().toISOString();
     step.status = "in_progress";
-    step.startedAt = new Date().toISOString();
+    step.startedAt = now;
     step.completedAt = null;
     step.error = null;
     session.lastStepStarted = stepName;
     session.failure = null;
     session.status = "in_progress";
+    const state = machineStateFromOnboardSessionStep(stepName);
+    shouldEmit = Boolean(state && shouldUpdateMachine(options));
+    if (state && shouldEmit) transitionMachineSnapshot(session, state, now);
     return session;
   });
+  if (shouldEmit) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({ type: "state.entered", session: updatedSession, step: stepName }),
+    );
+  }
+  return updatedSession;
 }
 
-export function markStepComplete(stepName: string, updates: SessionUpdates = {}): Session {
-  return updateSession((session) => {
+function markStepCompleteWithOptions(stepName: string, updates: SessionUpdates = {}, options: StepMutationOptions = {}): Session {
+  const safeUpdates = filterSafeUpdates(updates);
+  const hasUpdates = Object.keys(safeUpdates).length > 0;
+  let shouldEmit = false;
+  const updatedSession = updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
+    const now = new Date().toISOString();
     step.status = "complete";
-    step.completedAt = new Date().toISOString();
+    step.completedAt = now;
     step.error = null;
     session.lastCompletedStep = stepName;
     session.failure = null;
-    Object.assign(session, filterSafeUpdates(updates));
+    Object.assign(session, safeUpdates);
+    const nextState = nextMachineStateAfterCompletedStep(stepName, session);
+    shouldEmit = Boolean(nextState && shouldUpdateMachine(options));
+    if (nextState && shouldEmit) transitionMachineSnapshot(session, nextState, now);
     return session;
   });
+  if (hasUpdates) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({
+        type: "context.updated",
+        session: updatedSession,
+        step: stepName,
+        metadata: { fields: Object.keys(safeUpdates) },
+      }),
+    );
+  }
+  if (shouldEmit) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({ type: "state.completed", session: updatedSession, step: stepName }),
+    );
+  }
+  return updatedSession;
+}
+
+export function markStepStarted(stepName: string, options: StepMutationOptions = {}): Session {
+  return markStepStartedWithOptions(stepName, options);
+}
+
+export function markStepStartedRecordOnly(stepName: string): Session {
+  return markStepStartedWithOptions(stepName, { updateMachine: false });
+}
+
+export function markStepComplete(
+  stepName: string,
+  updates: SessionUpdates = {},
+  options: StepMutationOptions = {},
+): Session {
+  return markStepCompleteWithOptions(stepName, updates, options);
+}
+
+export function markStepCompleteRecordOnly(stepName: string, updates: SessionUpdates = {}): Session {
+  return markStepCompleteWithOptions(stepName, updates, { updateMachine: false });
 }
 
 export function markStepSkipped(stepName: string): Session {
-  return updateSession((session) => {
+  let shouldEmit = false;
+  const updatedSession = updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
-    if (step.status === "complete" || step.status === "failed") return session;
+    if (step.status === "complete" || step.status === "failed" || step.status === "skipped") return session;
     step.status = "skipped";
     step.startedAt = null;
     step.completedAt = null;
     step.error = null;
+    shouldEmit = true;
     return session;
   });
+  if (shouldEmit) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({ type: "state.skipped", session: updatedSession, step: stepName }),
+    );
+  }
+  return updatedSession;
 }
 
-export function markStepFailed(stepName: string, message: string | null = null): Session {
-  return updateSession((session) => {
+function markStepFailedWithOptions(stepName: string, message: string | null = null, options: StepMutationOptions = {}): Session {
+  let shouldEmit = false;
+  const updatedSession = updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
+    const now = new Date().toISOString();
     step.status = "failed";
     step.completedAt = null;
     step.error = redactSensitiveText(message);
-    session.failure = sanitizeFailure({
-      step: stepName,
-      message,
-      recordedAt: new Date().toISOString(),
-    });
-    session.status = "failed";
+    shouldEmit = shouldUpdateMachine(options);
+    if (shouldEmit) {
+      session.failure = sanitizeFailure({ step: stepName, message, recordedAt: now });
+      session.status = "failed";
+      transitionMachineSnapshot(session, "failed", now);
+    }
     return session;
   });
+  if (shouldEmit) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({
+        type: "state.failed",
+        session: updatedSession,
+        step: stepName,
+        error: message,
+      }),
+    );
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({
+        type: "onboard.failed",
+        session: updatedSession,
+        state: "failed",
+        step: stepName,
+        error: message,
+      }),
+    );
+  }
+  return updatedSession;
+}
+
+export function markStepFailed(
+  stepName: string,
+  message: string | null = null,
+  options: StepMutationOptions = {},
+): Session {
+  return markStepFailedWithOptions(stepName, message, options);
+}
+
+export function markStepFailedRecordOnly(stepName: string, message: string | null = null): Session {
+  return markStepFailedWithOptions(stepName, message, { updateMachine: false });
 }
 
 export function completeSession(updates: SessionUpdates = {}): Session {
-  return updateSession((session) => {
-    Object.assign(session, filterSafeUpdates(updates));
+  const safeUpdates = filterSafeUpdates(updates);
+  let wasComplete = false;
+  const updatedSession = updateSession((session) => {
+    const now = new Date().toISOString();
+    wasComplete = session.status === "complete";
+    Object.assign(session, safeUpdates);
     session.status = "complete";
     session.resumable = false;
     session.failure = null;
+    transitionMachineSnapshot(session, "complete", now);
     return session;
   });
+  if (Object.keys(safeUpdates).length > 0) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({
+        type: "context.updated",
+        session: updatedSession,
+        state: "complete",
+        metadata: { fields: Object.keys(safeUpdates) },
+      }),
+    );
+  }
+  if (!wasComplete) {
+    emitOnboardMachineEvent(
+      createOnboardMachineEvent({
+        type: "onboard.completed",
+        session: updatedSession,
+        state: "complete",
+      }),
+    );
+  }
+  return updatedSession;
 }
 
 export function summarizeForDebug(
@@ -955,11 +1217,13 @@ export function summarizeForDebug(
     hermesAuthMethod: session.hermesAuthMethod,
     preferredInferenceApi: session.preferredInferenceApi,
     nimContainer: session.nimContainer,
+    hermesToolGateways: session.hermesToolGateways,
     policyPresets: session.policyPresets,
     gpuPassthrough: session.gpuPassthrough,
     lastStepStarted: session.lastStepStarted,
     lastCompletedStep: session.lastCompletedStep,
     failure: sanitizeFailure(session.failure),
+    machine: session.machine,
     steps: Object.fromEntries(
       Object.entries(session.steps).map(([name, step]) => [
         name,

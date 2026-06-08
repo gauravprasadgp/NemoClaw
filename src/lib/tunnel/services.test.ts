@@ -1,20 +1,38 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import childProcess, { type SpawnSyncReturns } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Import from compiled dist/ so coverage is attributed correctly.
+import { resolveDefaultSandboxName } from "../../../dist/lib/tunnel/service-command";
 import {
   getServiceStatuses,
+  getTunnelUrl,
   readCloudflaredState,
   showStatus,
   startAll,
   stopAll,
 } from "../../../dist/lib/tunnel/services";
+
+const INTEGRATION_ENV_SANDBOX = "nc1077-env-sandbox";
+const INTEGRATION_REGISTRY_SANDBOX = "nc1077-registry-sandbox";
+const INTEGRATION_ENV_PID_DIR = `/tmp/nemoclaw-services-${INTEGRATION_ENV_SANDBOX}`;
+const INTEGRATION_REGISTRY_PID_DIR = `/tmp/nemoclaw-services-${INTEGRATION_REGISTRY_SANDBOX}`;
+
+function resetIntegrationPidDirs(): void {
+  for (const dir of [INTEGRATION_ENV_PID_DIR, INTEGRATION_REGISTRY_PID_DIR]) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function seedAliveCloudflaredPid(pidDir: string): void {
+  mkdirSync(pidDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(pidDir, "cloudflared.pid"), String(process.pid), { mode: 0o600 });
+}
 
 const ollamaProxyDistPath = resolve(
   import.meta.dirname,
@@ -27,6 +45,35 @@ const ollamaProxyDistPath = resolve(
   "ollama",
   "proxy.js",
 );
+
+describe("getTunnelUrl", () => {
+  let pidDir: string;
+
+  beforeEach(() => {
+    pidDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-url-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(pidDir, { recursive: true, force: true });
+  });
+
+  it("returns empty string when the cloudflared log does not exist", () => {
+    expect(getTunnelUrl(pidDir, 18789)).toBe("");
+  });
+
+  it("parses quick tunnel URLs and strips fragments", () => {
+    writeFileSync(join(pidDir, "cloudflared.log"), "https://abc-def.trycloudflare.com/path#secret\n");
+    expect(getTunnelUrl(pidDir, 18789)).toBe("https://abc-def.trycloudflare.com/path");
+  });
+
+  it("parses the named tunnel hostname matching the dashboard port", () => {
+    writeFileSync(
+      join(pidDir, "cloudflared.log"),
+      '2026-01-01T00:00:00Z INF Updated config="{\\"ingress\\":[{\\"hostname\\":\\"other.example.com\\", \\"service\\":\\"http://localhost:9999\\"}, {\\"hostname\\":\\"agent.example.com\\", \\"service\\":\\"http://localhost:18789\\"}]}" version=1\n',
+    );
+    expect(getTunnelUrl(pidDir, 18789)).toBe("https://agent.example.com");
+  });
+});
 
 describe("getServiceStatuses", () => {
   let pidDir: string;
@@ -95,6 +142,77 @@ describe("sandbox name validation", () => {
 
   it("accepts valid alphanumeric names", () => {
     expect(() => getServiceStatuses({ sandboxName: "my-sandbox.1" })).not.toThrow();
+  });
+});
+
+describe("#1077 — status host service PID dir matches start/stop env", () => {
+  const savedSandboxName = process.env.SANDBOX_NAME;
+  const savedNemoclawSandbox = process.env.NEMOCLAW_SANDBOX;
+  const savedNemoclawSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
+
+  beforeEach(() => {
+    delete process.env.SANDBOX_NAME;
+    delete process.env.NEMOCLAW_SANDBOX;
+    delete process.env.NEMOCLAW_SANDBOX_NAME;
+  });
+
+  afterEach(() => {
+    if (savedSandboxName !== undefined) process.env.SANDBOX_NAME = savedSandboxName;
+    else delete process.env.SANDBOX_NAME;
+    if (savedNemoclawSandbox !== undefined) process.env.NEMOCLAW_SANDBOX = savedNemoclawSandbox;
+    else delete process.env.NEMOCLAW_SANDBOX;
+    if (savedNemoclawSandboxName !== undefined) {
+      process.env.NEMOCLAW_SANDBOX_NAME = savedNemoclawSandboxName;
+    } else {
+      delete process.env.NEMOCLAW_SANDBOX_NAME;
+    }
+    resetIntegrationPidDirs();
+  });
+
+  it("reports running cloudflared when status passes env-resolved sandboxName", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const resolved = resolveDefaultSandboxName(() => ({
+      defaultSandbox: INTEGRATION_REGISTRY_SANDBOX,
+    }));
+    expect(resolved).toBe(INTEGRATION_ENV_SANDBOX);
+
+    const statuses = getServiceStatuses({ sandboxName: resolved });
+    const cloudflared = statuses.find((service) => service.name === "cloudflared");
+    expect(cloudflared?.running).toBe(true);
+    expect(cloudflared?.pid).toBe(process.pid);
+  });
+
+  it("reports stopped cloudflared when status passes registry sandbox but env PID dir has the process", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const statuses = getServiceStatuses({ sandboxName: INTEGRATION_REGISTRY_SANDBOX });
+    const cloudflared = statuses.find((service) => service.name === "cloudflared");
+    expect(cloudflared?.running).toBe(false);
+    expect(cloudflared?.pid).toBeNull();
+  });
+
+  it("showStatus prints running cloudflared from env-resolved production PID dir", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      showStatus({ sandboxName: resolveDefaultSandboxName(() => ({
+        defaultSandbox: INTEGRATION_REGISTRY_SANDBOX,
+      })) });
+      const output = logSpy.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
+      // Wrong PID dir would report "(stopped)" with no PID; env-resolved dir finds our pid file.
+      expect(output).not.toContain("cloudflared  (stopped)");
+      expect(output).toContain(`cloudflared  (stale PID ${String(process.pid)})`);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
@@ -174,15 +292,22 @@ describe("startAll", () => {
   let tmpDir: string;
   let pidDir: string;
   let originalPath: string | undefined;
+  let originalCloudflareTunnelToken: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-start-test-"));
     pidDir = join(tmpDir, "pids");
     originalPath = process.env.PATH;
+    originalCloudflareTunnelToken = process.env.CLOUDFLARE_TUNNEL_TOKEN;
   });
 
   afterEach(() => {
     process.env.PATH = originalPath;
+    if (originalCloudflareTunnelToken === undefined) {
+      delete process.env.CLOUDFLARE_TUNNEL_TOKEN;
+    } else {
+      process.env.CLOUDFLARE_TUNNEL_TOKEN = originalCloudflareTunnelToken;
+    }
     const pid = readCloudflaredState(pidDir);
     if (pid.kind === "running") {
       try {
@@ -222,6 +347,36 @@ describe("startAll", () => {
     expect(output).toContain("https://good.trycloudflare.com/route");
     expect(output).not.toContain("evil.test");
     expect(output).not.toContain("secret-fragment");
+  });
+
+  it("starts a named tunnel from CLOUDFLARE_TUNNEL_TOKEN without putting the token in argv", async () => {
+    const binDir = join(tmpDir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fakeCloudflared = join(binDir, "cloudflared");
+    writeFileSync(
+      fakeCloudflared,
+      [
+        "#!/usr/bin/env sh",
+        "printf 'argv:%s\\n' \"$*\"",
+        "if [ \"${TUNNEL_TOKEN:-}\" = 'named-secret' ]; then echo token-env-present; fi",
+        "echo 'config=\"{\\\"ingress\\\":[{\\\"hostname\\\":\\\"agent.example.com\\\", \\\"service\\\":\\\"http://localhost:12345\\\"}]}\"'",
+        "sleep 20",
+      ].join("\n"),
+    );
+    chmodSync(fakeCloudflared, 0o700);
+    process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+    process.env.CLOUDFLARE_TUNNEL_TOKEN = "named-secret";
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345 });
+
+    const log = readFileSync(join(pidDir, "cloudflared.log"), "utf-8");
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(log).toContain("argv:tunnel run");
+    expect(log).toContain("token-env-present");
+    expect(log).not.toContain("named-secret");
+    expect(output).toContain("https://agent.example.com");
   });
 });
 

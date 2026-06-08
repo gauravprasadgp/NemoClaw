@@ -47,7 +47,14 @@ describe("agent definitions", () => {
       envFile: null,
       format: "json",
     });
-    expect(openclaw.messagingPlatforms).toEqual(["telegram", "discord", "slack", "wechat"]);
+    expect(openclaw.messagingPlatforms).toEqual([
+      "telegram",
+      "discord",
+      "slack",
+      "wechat",
+      "whatsapp",
+    ]);
+    expect(openclaw.inferenceProviderOptions).toEqual([]);
     expect(openclaw.legacyPaths?.startScript).toContain("scripts/nemoclaw-start.sh");
   });
 
@@ -65,7 +72,23 @@ describe("agent definitions", () => {
     });
     expect(hermes.inferenceProviderOptions).toEqual(["hermesProvider"]);
     expect(hermes.healthProbe.url).toBe("http://localhost:8642/health");
-    expect(hermes.messagingPlatforms).toEqual(["telegram", "discord", "slack", "wechat"]);
+    expect(hermes.forwardPort).toBe(18789);
+    expect(hermes.forward_ports).toEqual([18789, 8642]);
+    expect(hermes.dashboard).toEqual({
+      kind: "ui",
+      label: "Dashboard",
+      path: "/",
+      healthPath: "/api/status",
+      auth: "session",
+    });
+    expect(hermes.dashboardUi).toBeNull();
+    expect(hermes.messagingPlatforms).toEqual([
+      "telegram",
+      "discord",
+      "slack",
+      "wechat",
+      "whatsapp",
+    ]);
   });
 
   it("orders OpenClaw first in interactive choices", () => {
@@ -81,6 +104,12 @@ describe("agent definitions", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("session references unknown agent 'missing-agent'"),
     );
+  });
+
+  it("treats an explicit agent flag as overriding NEMOCLAW_AGENT", () => {
+    process.env.NEMOCLAW_AGENT = "hermes";
+
+    expect(resolveAgentName({ agentFlag: "openclaw" })).toBe("openclaw");
   });
 
   it("rejects non-object manifest payloads", () => {
@@ -117,6 +146,56 @@ describe("agent definitions", () => {
     );
 
     expect(() => loadAgent(agentName)).toThrow(/health_probe\.port/);
+  });
+
+  it("rejects invalid dashboard auth values in manifests", () => {
+    const agentName = `invalid-dashboard-auth-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard Auth",
+        "dashboard:",
+        "  kind: ui",
+        "  auth: bearer",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard\.auth/);
+  });
+
+  it("rejects invalid dashboard health path values in manifests", () => {
+    const agentName = `invalid-dashboard-health-path-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard Health Path",
+        "dashboard:",
+        "  kind: ui",
+        "  health_path: api/status",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard\.health_path/);
+  });
+
+  it("rejects invalid dashboard_ui.port values in manifests", () => {
+    const agentName = `invalid-dashboard-ui-port-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard UI",
+        "dashboard_ui:",
+        "  label: Web dashboard",
+        "  port: 1023",
+        "  enable_env: NEMOCLAW_TEST_DASHBOARD",
+        "  port_env: NEMOCLAW_TEST_DASHBOARD_PORT",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard_ui\.port/);
   });
 
   it("rejects invalid inference provider options in manifests", () => {

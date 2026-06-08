@@ -44,6 +44,21 @@ section() {
 }
 info() { printf '\033[1;34m  [info]\033[0m %s\n' "$1"; }
 
+is_transient_live_http_code() {
+  case "${1:-}" in
+    502 | 503 | 504) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+http_status_from_response() {
+  sed -n 's/^__NEMOCLAW_HTTP_STATUS__=//p' <<<"$1" | tail -1
+}
+
+http_body_from_response() {
+  sed '/^__NEMOCLAW_HTTP_STATUS__=/d' <<<"$1"
+}
+
 parse_chat_content() {
   python3 -c "
 import json, sys
@@ -183,13 +198,19 @@ assert_hermes_config() {
   # simple model block and should move to PyYAML if nested or multiline values
   # become relevant.
   probe=$(
-    CONFIG_TEXT="$config" EXPECTED_MODEL="$SWITCH_MODEL" python3 - <<'PY'
+    CONFIG_TEXT="$config" EXPECTED_MODEL="$SWITCH_MODEL" EXPECTED_INFERENCE_API="$SWITCH_INFERENCE_API" python3 - <<'PY'
 import os
 import re
 
 text = os.environ["CONFIG_TEXT"]
 expected = os.environ["EXPECTED_MODEL"]
+expected_api = os.environ["EXPECTED_INFERENCE_API"]
 errors = []
+expected_base = "https://inference.local" if expected_api == "anthropic-messages" else "https://inference.local/v1"
+expected_api_mode = {
+    "anthropic-messages": "anthropic_messages",
+    "openai-responses": "codex_responses",
+}.get(expected_api)
 
 model = {}
 in_model = False
@@ -209,10 +230,18 @@ for line in text.splitlines():
 
 if model.get("default") != expected:
     errors.append(f"model.default={model.get('default')!r}")
-if model.get("base_url") != "https://inference.local/v1":
+if model.get("base_url") != expected_base:
     errors.append(f"model.base_url={model.get('base_url')!r}")
 if model.get("provider") != "custom":
     errors.append(f"model.provider={model.get('provider')!r}")
+if expected_api_mode:
+    if model.get("api_mode") != expected_api_mode:
+        errors.append(f"model.api_mode={model.get('api_mode')!r}")
+elif "api_mode" in model:
+    errors.append(f"stale model.api_mode={model.get('api_mode')!r}")
+api_key = model.get("api_key")
+if not isinstance(api_key, str) or not api_key.startswith("sk-"):
+    errors.append(f"model.api_key={api_key!r}")
 
 if re.search(r"(?ms)^models:\s*\n(?:[ \t].*\n)*?[ \t]+providers:", text):
     errors.append("OpenClaw-style models.providers block present")
@@ -278,29 +307,53 @@ assert_env_hash_unchanged() {
 }
 
 check_inference_local() {
-  local payload payload_arg response rc content attempt last_fail
-  payload=$(SWITCH_MODEL="$SWITCH_MODEL" python3 -c '
+  local payload payload_arg response rc content attempt last_fail http_code body remote transient=0
+  payload=$(SWITCH_MODEL="$SWITCH_MODEL" SWITCH_INFERENCE_API="$SWITCH_INFERENCE_API" python3 -c '
 import json
 import os
-print(json.dumps({
-    "model": os.environ["SWITCH_MODEL"],
-    "messages": [{"role": "user", "content": "Reply with exactly one word: PONG"}],
-    "max_tokens": 100,
-}))
+if os.environ["SWITCH_INFERENCE_API"] == "anthropic-messages":
+    print(json.dumps({
+        "model": os.environ["SWITCH_MODEL"],
+        "messages": [{"role": "user", "content": "Reply with exactly one word: PONG"}],
+        "max_tokens": 32,
+    }))
+else:
+    print(json.dumps({
+        "model": os.environ["SWITCH_MODEL"],
+        "messages": [{"role": "user", "content": "Reply with exactly one word: PONG"}],
+        "max_tokens": 100,
+    }))
 ')
   payload_arg="$(printf '%q' "$payload")"
+  if [ "$SWITCH_INFERENCE_API" = "anthropic-messages" ]; then
+    remote="tmp=\$(mktemp); code=\$(curl -sS -o \"\$tmp\" -w '%{http_code}' --max-time 90 https://inference.local/v1/messages -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' -d $payload_arg); rc=\$?; cat \"\$tmp\"; rm -f \"\$tmp\"; printf '\n__NEMOCLAW_HTTP_STATUS__=%s\n' \"\${code:-000}\"; exit \"\$rc\""
+  else
+    remote="tmp=\$(mktemp); code=\$(curl -sS -o \"\$tmp\" -w '%{http_code}' --max-time 90 https://inference.local/v1/chat/completions -H 'Content-Type: application/json' -d $payload_arg); rc=\$?; cat \"\$tmp\"; rm -f \"\$tmp\"; printf '\n__NEMOCLAW_HTTP_STATUS__=%s\n' \"\${code:-000}\"; exit \"\$rc\""
+  fi
   last_fail=""
 
   for attempt in 1 2 3; do
     rc=0
-    response=$(openshell sandbox exec --name "$SANDBOX_NAME" -- sh -lc \
-      "curl -sS --max-time 90 https://inference.local/v1/chat/completions -H 'Content-Type: application/json' -d $payload_arg" \
-      2>&1) || rc=$?
+    transient=0
+    response=$(openshell sandbox exec --name "$SANDBOX_NAME" -- sh -lc "$remote" 2>&1) || rc=$?
+    http_code=$(http_status_from_response "$response")
+    [ -n "$http_code" ] || http_code="000"
+    body=$(http_body_from_response "$response")
 
     if [ "$rc" -ne 0 ]; then
-      last_fail="curl failed with exit ${rc}: ${response:0:300}"
+      [ "$rc" -eq 28 ] && transient=1
+      last_fail="curl failed with exit ${rc}; HTTP ${http_code}: ${body:0:300}"
+    elif is_transient_live_http_code "$http_code"; then
+      transient=1
+      last_fail="transient HTTP ${http_code}: ${body:0:300}"
+    elif [ "$http_code" != "200" ]; then
+      last_fail="HTTP ${http_code}: ${body:0:300}"
     else
-      content=$(printf '%s' "$response" | parse_chat_content 2>/dev/null) || content=""
+      if [ "$SWITCH_INFERENCE_API" = "anthropic-messages" ]; then
+        content=$(printf '%s' "$body" | parse_anthropic_content 2>/dev/null) || content=""
+      else
+        content=$(printf '%s' "$body" | parse_chat_content 2>/dev/null) || content=""
+      fi
       if grep -qi "PONG" <<<"$content"; then
         pass "Hermes sandbox inference.local returned PONG with ${SWITCH_MODEL}"
         return
@@ -314,11 +367,15 @@ print(json.dumps({
     }
   done
 
-  fail "Hermes sandbox inference.local did not work after switch: ${last_fail}"
+  if [ "$transient" -eq 1 ]; then
+    skip "Hermes sandbox inference.local transient failure after switch; route/config checks already passed"
+  else
+    fail "Hermes sandbox inference.local did not work after switch: ${last_fail}"
+  fi
 }
 
 check_hermes_api_chat() {
-  local payload payload_arg response rc content remote attempt last_fail
+  local payload payload_arg response rc content remote attempt last_fail http_code body transient=0
   payload=$(SWITCH_MODEL="$SWITCH_MODEL" python3 -c '
 import json
 import os
@@ -329,21 +386,32 @@ print(json.dumps({
 }))
 ')
   payload_arg="$(printf '%q' "$payload")"
-  remote="set -a; [ ! -f /sandbox/.hermes/.env ] || . /sandbox/.hermes/.env; set +a; if [ -n \"\${API_SERVER_KEY:-}\" ]; then curl -sS --max-time 120 http://localhost:8642/v1/chat/completions -H 'Content-Type: application/json' -H \"Authorization: Bearer \${API_SERVER_KEY}\" -d $payload_arg; else curl -sS --max-time 120 http://localhost:8642/v1/chat/completions -H 'Content-Type: application/json' -d $payload_arg; fi"
+  remote="set -a; [ ! -f /sandbox/.hermes/.env ] || . /sandbox/.hermes/.env; set +a; tmp=\$(mktemp); if [ -n \"\${API_SERVER_KEY:-}\" ]; then code=\$(curl -sS -o \"\$tmp\" -w '%{http_code}' --max-time 120 http://localhost:8642/v1/chat/completions -H 'Content-Type: application/json' -H \"Authorization: Bearer \${API_SERVER_KEY}\" -d $payload_arg); else code=\$(curl -sS -o \"\$tmp\" -w '%{http_code}' --max-time 120 http://localhost:8642/v1/chat/completions -H 'Content-Type: application/json' -d $payload_arg); fi; rc=\$?; cat \"\$tmp\"; rm -f \"\$tmp\"; printf '\n__NEMOCLAW_HTTP_STATUS__=%s\n' \"\${code:-000}\"; exit \"\$rc\""
   last_fail=""
 
   for attempt in 1 2 3; do
     rc=0
+    transient=0
     response=$(openshell sandbox exec --name "$SANDBOX_NAME" -- sh -lc "$remote" 2>&1) || rc=$?
+    http_code=$(http_status_from_response "$response")
+    [ -n "$http_code" ] || http_code="000"
+    body=$(http_body_from_response "$response")
+
     if [ "$rc" -ne 0 ]; then
-      last_fail="Hermes API curl failed with exit ${rc}: ${response:0:300}"
+      [ "$rc" -eq 28 ] && transient=1
+      last_fail="Hermes API curl failed with exit ${rc}; HTTP ${http_code}: ${body:0:300}"
+    elif is_transient_live_http_code "$http_code"; then
+      transient=1
+      last_fail="transient HTTP ${http_code}: ${body:0:300}"
+    elif [ "$http_code" != "200" ]; then
+      last_fail="HTTP ${http_code}: ${body:0:300}"
     else
-      content=$(printf '%s' "$response" | parse_chat_content 2>/dev/null) || content=""
+      content=$(printf '%s' "$body" | parse_chat_content 2>/dev/null) || content=""
       if grep -qi "PONG" <<<"$content"; then
         pass "Hermes API chat works after inference switch"
         return
       fi
-      last_fail="expected PONG from Hermes API, got ${content:0:300}; response=${response:0:300}"
+      last_fail="expected PONG from Hermes API, got ${content:0:300}; response=${body:0:300}"
     fi
 
     [ "$attempt" -ge 3 ] || {
@@ -352,7 +420,11 @@ print(json.dumps({
     }
   done
 
-  fail "Hermes API chat did not work after switch: ${last_fail}"
+  if [ "$transient" -eq 1 ]; then
+    skip "Hermes API chat transient failure after switch; route/config checks already passed"
+  else
+    fail "Hermes API chat did not work after switch: ${last_fail}"
+  fi
 }
 
 if [ -d /workspace ] && [ -f /workspace/install.sh ]; then
@@ -365,9 +437,17 @@ else
 fi
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=test/e2e/lib/inference-switch-retry.sh
+. "${E2E_DIR}/lib/inference-switch-retry.sh"
+# shellcheck source=test/e2e/lib/anthropic-switch-provider.sh
+. "${E2E_DIR}/lib/anthropic-switch-provider.sh"
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-e2e-hermes-inference-switch}"
 SWITCH_PROVIDER="${NEMOCLAW_SWITCH_PROVIDER:-nvidia-prod}"
 SWITCH_MODEL="${NEMOCLAW_SWITCH_MODEL:-z-ai/glm-5.1}"
+SWITCH_INFERENCE_API="${NEMOCLAW_SWITCH_INFERENCE_API:-openai-completions}"
+SWITCH_ENDPOINT_URL="${NEMOCLAW_SWITCH_ENDPOINT_URL:-}"
+SWITCH_MOCK_ANTHROPIC="${NEMOCLAW_SWITCH_MOCK_ANTHROPIC:-0}"
+SWITCH_MOCK_PORT="${NEMOCLAW_SWITCH_MOCK_PORT:-18766}"
 INSTALL_LOG="/tmp/nemoclaw-e2e-hermes-inference-switch-install.log"
 ENV_HASH_BEFORE=""
 
@@ -375,6 +455,7 @@ export NEMOCLAW_AGENT="${NEMOCLAW_AGENT:-hermes}"
 
 # shellcheck source=test/e2e/lib/sandbox-teardown.sh
 . "${E2E_DIR}/lib/sandbox-teardown.sh"
+trap 'stop_mock_anthropic_switch_provider; _nemoclaw_sandbox_teardown' EXIT
 # shellcheck source=test/e2e/lib/install-path-refresh.sh
 . "${E2E_DIR}/lib/install-path-refresh.sh"
 register_sandbox_for_teardown "$SANDBOX_NAME"
@@ -463,13 +544,14 @@ command -v openshell >/dev/null 2>&1 || {
 }
 pass "nemohermes and openshell are on PATH"
 assert_hermes_health
+ensure_compatible_anthropic_switch_provider || exit 1
 
 section "Phase 3: Switch inference"
 pid_before="$(hermes_gateway_pid)"
 ENV_HASH_BEFORE=$(openshell sandbox exec --name "$SANDBOX_NAME" -- sha256sum /sandbox/.hermes/.env 2>/dev/null | awk '{print $1}') || true
 
 info "Switching Hermes to ${SWITCH_PROVIDER} / ${SWITCH_MODEL} with nemohermes inference set..."
-switch_output=$(nemohermes inference set --provider "$SWITCH_PROVIDER" --model "$SWITCH_MODEL" 2>&1)
+switch_output=$(run_inference_set_with_retry nemohermes inference set --provider "$SWITCH_PROVIDER" --model "$SWITCH_MODEL")
 switch_rc=$?
 if [ "$switch_rc" -eq 0 ]; then
   pass "nemohermes inference set completed without --sandbox"

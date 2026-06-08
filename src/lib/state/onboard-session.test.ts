@@ -1,19 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 const distPath = require.resolve("../../../dist/lib/state/onboard-session");
+const eventsDistPath = require.resolve("../../../dist/lib/onboard/machine/events");
 const originalHome = process.env.HOME;
 type OnboardSessionModule = typeof import("../../../dist/lib/state/onboard-session");
+type OnboardMachineEventsModule = typeof import("../../../dist/lib/onboard/machine/events");
+type OnboardMachineEvent = import("../../../dist/lib/onboard/machine/events").OnboardMachineEvent;
 type LoadedSession = NonNullable<ReturnType<OnboardSessionModule["loadSession"]>>;
 type DebugSummary = NonNullable<ReturnType<OnboardSessionModule["summarizeForDebug"]>>;
 let session: OnboardSessionModule;
+let machineEvents: OnboardMachineEventsModule;
 let tmpDir: string;
 
 function requireLoadedSession(
@@ -36,6 +40,14 @@ function requireDebugSummary(
   return summary;
 }
 
+function normalizeLegacySession(
+  legacy: unknown,
+): ReturnType<OnboardSessionModule["normalizeSession"]> {
+  return session.normalizeSession(
+    legacy as Parameters<OnboardSessionModule["normalizeSession"]>[0],
+  );
+}
+
 beforeEach(() => {
   // Recreate tmpDir per test so lock artifacts (and any other on-disk state)
   // from a previous test cannot leak into this one. Without this, malformed
@@ -44,13 +56,18 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-session-"));
   process.env.HOME = tmpDir;
   delete require.cache[distPath];
+  delete require.cache[eventsDistPath];
   session = require("../../../dist/lib/state/onboard-session");
+  machineEvents = require("../../../dist/lib/onboard/machine/events");
+  machineEvents.clearOnboardMachineEventListeners();
   session.clearSession();
   session.releaseOnboardLock();
 });
 
 afterEach(() => {
+  machineEvents.clearOnboardMachineEventListeners();
   delete require.cache[distPath];
+  delete require.cache[eventsDistPath];
   fs.rmSync(tmpDir, { recursive: true, force: true });
   if (originalHome === undefined) {
     delete process.env.HOME;
@@ -65,12 +82,21 @@ describe("onboard session", () => {
   });
 
   it("creates and persists a session with restrictive permissions", () => {
-    const created = session.createSession({ mode: "non-interactive" });
+    const created = session.createSession({
+      mode: "non-interactive",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
     const saved = session.saveSession(created);
     const stat = fs.statSync(session.SESSION_FILE);
     const dirStat = fs.statSync(path.dirname(session.SESSION_FILE));
 
     expect(saved.mode).toBe("non-interactive");
+    expect(saved.machine).toMatchObject({
+      version: 1,
+      state: "init",
+      revision: 0,
+    });
+    expect(saved.machine.stateEnteredAt).toBe("2026-01-01T00:00:00.000Z");
     expect(fs.existsSync(session.SESSION_FILE)).toBe(true);
     expect(stat.mode & 0o777).toBe(0o600);
     expect(dirStat.mode & 0o777).toBe(0o700);
@@ -115,6 +141,229 @@ describe("onboard session", () => {
     }
     expect(loaded.failure.step).toBe("sandbox");
     expect(loaded.failure.message).toMatch(/Sandbox creation failed/);
+    expect(loaded.machine.state).toBe("failed");
+  });
+
+  it("can record step boundaries without mutating the machine snapshot", () => {
+    const emitted: OnboardMachineEvent[] = [];
+    machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
+    session.saveSession(session.createSession());
+
+    session.markStepStarted("preflight", { updateMachine: false });
+    let loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.preflight.status).toBe("in_progress");
+    expect(loaded.status).toBe("in_progress");
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepComplete("preflight", { sandboxName: "my-assistant" }, { updateMachine: false });
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.preflight.status).toBe("complete");
+    expect(loaded.sandboxName).toBe("my-assistant");
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepFailed("gateway", "Gateway failed", { updateMachine: false });
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.gateway.status).toBe("failed");
+    expect(loaded.status).toBe("in_progress");
+    expect(loaded.failure).toBeNull();
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+    expect(emitted.map((event) => event.type)).toEqual(["context.updated"]);
+  });
+
+  it("persists a compact machine snapshot across step boundaries", () => {
+    session.saveSession(session.createSession());
+    let loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "init", revision: 0 });
+
+    session.markStepStarted("preflight");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "preflight", revision: 1 });
+    expect(loaded.machine.stateEnteredAt).toBe(loaded.steps.preflight.startedAt);
+
+    session.markStepComplete("preflight");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "gateway", revision: 2 });
+    expect(loaded.machine.stateEnteredAt).toBe(loaded.steps.preflight.completedAt);
+
+    session.markStepComplete("gateway");
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "provider_selection", revision: 3 });
+
+    session.completeSession();
+    loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.machine).toMatchObject({ state: "complete", revision: 4 });
+    expect(requireDebugSummary(session.summarizeForDebug()).machine).toEqual(loaded.machine);
+  });
+
+  it("normalizes old sessions without machine snapshots", () => {
+    type LegacySession = Omit<ReturnType<OnboardSessionModule["createSession"]>, "machine"> & {
+      machine?: unknown;
+    };
+    const legacy = session.createSession({
+      sessionId: "legacy-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:05:00.000Z",
+    }) as unknown as LegacySession;
+    delete legacy.machine;
+    legacy.steps.gateway.status = "in_progress";
+    legacy.steps.gateway.startedAt = "2026-01-01T00:02:00.000Z";
+    legacy.lastStepStarted = "gateway";
+
+    let normalized = requireLoadedSession(normalizeLegacySession(legacy));
+    expect(normalized.machine).toEqual({
+      version: 1,
+      state: "gateway",
+      stateEnteredAt: "2026-01-01T00:02:00.000Z",
+      revision: 0,
+    });
+
+    legacy.steps.gateway.status = "complete";
+    legacy.steps.gateway.completedAt = "2026-01-01T00:03:00.000Z";
+    legacy.lastCompletedStep = "gateway";
+    normalized = requireLoadedSession(normalizeLegacySession(legacy));
+    expect(normalized.machine).toEqual({
+      version: 1,
+      state: "provider_selection",
+      stateEnteredAt: "2026-01-01T00:03:00.000Z",
+      revision: 0,
+    });
+
+    legacy.status = "failed";
+    legacy.failure = {
+      step: "gateway",
+      message: "boom",
+      recordedAt: "2026-01-01T00:04:00.000Z",
+    };
+    normalized = requireLoadedSession(normalizeLegacySession(legacy));
+    expect(normalized.machine).toEqual({
+      version: 1,
+      state: "failed",
+      stateEnteredAt: "2026-01-01T00:04:00.000Z",
+      revision: 0,
+    });
+
+    legacy.status = "complete";
+    normalized = requireLoadedSession(normalizeLegacySession(legacy));
+    expect(normalized.machine.state).toBe("complete");
+  });
+
+  it("normalizes invalid machine snapshots from old sessions", () => {
+    type LegacySession = Omit<ReturnType<OnboardSessionModule["createSession"]>, "machine"> & {
+      machine?: unknown;
+    };
+    const legacy = session.createSession({ lastCompletedStep: "policies" }) as unknown as LegacySession;
+    legacy.steps.policies.status = "complete";
+    legacy.steps.policies.completedAt = "2026-01-01T00:08:00.000Z";
+    legacy.machine = {
+      version: 1,
+      state: "not-a-state",
+      stateEnteredAt: "2026-01-01T00:09:00.000Z",
+      revision: -1,
+    };
+
+    const normalized = requireLoadedSession(normalizeLegacySession(legacy));
+    expect(normalized.machine).toEqual({
+      version: 1,
+      state: "finalizing",
+      stateEnteredAt: "2026-01-01T00:08:00.000Z",
+      revision: 0,
+    });
+  });
+
+  it("emits redacted structured machine events for session step mutations", () => {
+    const emitted: OnboardMachineEvent[] = [];
+    machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
+
+    session.saveSession(session.createSession({ sessionId: "session-1" }));
+    session.markStepStarted("gateway");
+    session.markStepComplete("gateway", {
+      sandboxName: "my-assistant",
+      endpointUrl:
+        "https://alice:super-secret-token@example.com/v1?token=super-secret-token&keep=yes#token=super-secret-token",
+      credentialEnv: "NVIDIA_API_KEY",
+    });
+    session.markStepSkipped("openclaw");
+    session.markStepFailed("sandbox", "NVIDIA_API_KEY=super-secret-token");
+    session.completeSession({ provider: "ollama-local", credentialEnv: null });
+
+    expect(emitted.map((event) => event.type)).toEqual([
+      "state.entered",
+      "context.updated",
+      "state.completed",
+      "state.skipped",
+      "state.failed",
+      "onboard.failed",
+      "context.updated",
+      "onboard.completed",
+    ]);
+    expect(emitted[0]).toMatchObject({
+      version: 1,
+      sessionId: "session-1",
+      state: "gateway",
+      step: "gateway",
+      error: null,
+    });
+    expect(emitted[1].context).toMatchObject({
+      sandboxName: "my-assistant",
+      credentialEnv: "NVIDIA_API_KEY",
+    });
+    expect(emitted[1].context.endpointOrigin).toBe("https://example.com");
+    expect(emitted[1].metadata.fields).toEqual([
+      "sandboxName",
+      "endpointUrl",
+      "credentialEnv",
+    ]);
+    expect(emitted[4]).toMatchObject({
+      type: "state.failed",
+      state: "sandbox",
+      step: "sandbox",
+      error: "NVIDIA_API_KEY=<REDACTED>",
+    });
+    expect(emitted[5]).toMatchObject({ type: "onboard.failed", state: "failed" });
+    expect(emitted.at(-1)).toMatchObject({ type: "onboard.completed", state: "complete" });
+    expect(JSON.stringify(emitted)).not.toContain("super-secret-token");
+
+    const persisted = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    expect(persisted.events).toBeUndefined();
+  });
+
+  it("keeps event observer failures from changing session mutation behavior", () => {
+    machineEvents.addOnboardMachineEventListener(() => {
+      throw new Error("observer failed");
+    });
+
+    session.saveSession(session.createSession());
+    expect(() => session.markStepStarted("preflight")).not.toThrow();
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded.steps.preflight.status).toBe("in_progress");
+  });
+
+  it("does not emit machine events for unknown session step names", () => {
+    const emitted: OnboardMachineEvent[] = [];
+    machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
+
+    session.saveSession(session.createSession());
+    session.markStepStarted("not_a_real_step");
+
+    expect(emitted).toEqual([]);
+  });
+
+  it("does not emit duplicate events for no-op skipped and completed transitions", () => {
+    const emitted: OnboardMachineEvent[] = [];
+    machineEvents.addOnboardMachineEventListener((event) => emitted.push(event));
+
+    session.saveSession(session.createSession({ sessionId: "session-1" }));
+    session.markStepSkipped("openclaw");
+    session.markStepSkipped("openclaw");
+    session.completeSession();
+    session.completeSession();
+
+    expect(emitted.map((event) => event.type)).toEqual([
+      "state.skipped",
+      "onboard.completed",
+    ]);
+    expect(emitted).toHaveLength(2);
   });
 
   it("persists safe provider metadata without persisting secrets", () => {
@@ -631,8 +880,8 @@ describe("onboard session", () => {
     //      ORIGINAL stale lock (dead PID 999999), isProcessAlive
     //      returns false, and acquireOnboardLock enters the stale-
     //      cleanup path calling unlinkIfInodeMatches.
-    //    - stat #2 (inside unlinkIfInodeMatches): BEFORE the actual
-    //      stat, swap the file for a fresh claim. stat #2 then sees
+    //    - stat #1 (inside unlinkIfInodeMatches): BEFORE the actual
+    //      stat, swap the file for a fresh claim. stat #1 then sees
     //      a different inode → must skip the unlink.
     //
     //    CodeRabbit correctly flagged the original test: swapping on
@@ -642,10 +891,10 @@ describe("onboard session", () => {
     const originalStatSync = fs.statSync;
     const statSpy = vi.spyOn(fs, "statSync").mockImplementation((...args) => {
       statCallCount += 1;
-      // Just before stat #2 (inside unlinkIfInodeMatches), simulate
+      // Just before stat #1 (inside unlinkIfInodeMatches), simulate
       // the race: a concurrent fast process unlinks the stale lock
-      // and writes a fresh claim. stat #2 then sees a new inode.
-      if (statCallCount === 2) {
+      // and writes a fresh claim. stat #1 then sees a new inode.
+      if (statCallCount === 1) {
         // Write the fresh claim to a temp file first, then rename over
         // the stale lock. This guarantees a different inode even on
         // tmpfs/overlayfs which can reuse inodes after unlink+recreate.
@@ -665,9 +914,9 @@ describe("onboard session", () => {
     });
 
     try {
-      // The acquire call will see EEXIST (stale lock present), stat it,
-      // then the swap happens, then the second stat (inside the cleanup
-      // helper) sees a different inode → must NOT unlink.
+      // The acquire call will see EEXIST (stale lock present), read it
+      // through a pinned descriptor, then the stat inside the cleanup
+      // helper sees a different inode → must NOT unlink.
       const result = session.acquireOnboardLock("nemoclaw onboard --resume");
       // The fresh lock that the simulated concurrent process wrote
       // should still be on disk after acquireOnboardLock returns.
@@ -727,7 +976,7 @@ describe("onboard session", () => {
     const statSpy = vi.spyOn(fs, "statSync").mockImplementation((...args) => {
       if (args[0] === session.LOCK_FILE) {
         statCallCount += 1;
-        if (statCallCount === 3) {
+        if (statCallCount === 1) {
           const tmpClaim = session.LOCK_FILE + ".race-tmp";
           fs.writeFileSync(
             tmpClaim,

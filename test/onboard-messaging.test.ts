@@ -72,7 +72,7 @@ runner.runCapture = (command) => {
   if (_n(command).includes("sandbox get my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   if (_n(command).includes("provider get")) return "Provider: discord-bridge";
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command, {
       defaultCurlOutput: "ok",
@@ -92,7 +92,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  const command = _n(args[1][1]);
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
   const policyMatch = command.match(/--policy ([^ ]+)/);
   if (policyMatch) {
@@ -110,18 +112,24 @@ childProcess.spawn = (...args) => {
   return child;
 };
 
-const { createSandbox } = require(${onboardPath});
+const { createSandbox, setupMessagingChannels } = require(${onboardPath});
 
 (async () => {
   process.env.OPENSHELL_GATEWAY = "nemoclaw";
+  process.env.NEMOCLAW_SKIP_TELEGRAM_REACHABILITY = "1";
   process.env.DISCORD_BOT_TOKEN = "test-discord-token-value";
   process.env.SLACK_BOT_TOKEN = "xoxb-test-slack-token-value";
   process.env.SLACK_APP_TOKEN = "xapp-test-slack-app-token-value";
   process.env.TELEGRAM_BOT_TOKEN = "123456:ABC-test-telegram-token";
   process.env.KUBECONFIG = "/tmp/host-kubeconfig";
   process.env.SSH_AUTH_SOCK = "/tmp/host-ssh-agent.sock";
+  await setupMessagingChannels(null, null, "my-assistant");
   const sandboxName = await createSandbox(null, "gpt-5.4");
-  console.log(JSON.stringify({ sandboxName, commands }));
+  console.log(JSON.stringify({
+    sandboxName,
+    commands,
+    messagingPlanEnv: process.env.NEMOCLAW_MESSAGING_PLAN_B64,
+  }));
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -203,6 +211,19 @@ const { createSandbox } = require(${onboardPath});
       assert.doesNotMatch(createCommand.command, /xapp-test-slack-app-token-value/);
       assert.doesNotMatch(createCommand.command, /SLACK_BOT_TOKEN=/);
       assert.doesNotMatch(createCommand.command, /SLACK_APP_TOKEN=/);
+      assert.doesNotMatch(createCommand.command, /NEMOCLAW_MESSAGING_PLAN_B64=/);
+
+      assert.ok(payload.messagingPlanEnv, "expected serialized messaging plan in host process env");
+      const messagingPlan = JSON.parse(
+        Buffer.from(payload.messagingPlanEnv, "base64").toString("utf8"),
+      );
+      assert.equal(messagingPlan.sandboxName, "my-assistant");
+      assert.deepEqual(
+        messagingPlan.channels.map((channel: { channelId: string }) => channel.channelId).sort(),
+        ["discord", "slack", "telegram"].sort(),
+      );
+      assert.doesNotMatch(JSON.stringify(messagingPlan), /test-discord-token-value/);
+      assert.doesNotMatch(JSON.stringify(messagingPlan), /123456:ABC-test-telegram-token/);
 
       // Verify blocked credentials are NOT in the sandbox spawn environment
       assert.ok(createCommand.env, "expected env to be captured from spawn call");
@@ -327,7 +348,7 @@ runner.run = (command, opts = {}) => {
 runner.runCapture = (command) => {
   if (_n(command).includes("sandbox get my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command, {
       defaultCurlOutput: "ok",
@@ -350,7 +371,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  const command = _n(args[1][1]);
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
   const policyMatch = command.match(/--policy ([^ ]+)/);
   if (policyMatch) {
@@ -493,12 +516,6 @@ const registerCalls = [];
 registry.registerSandbox({
   name: "my-assistant",
   messagingChannels: ["discord", "slack"],
-  providerCredentialHashes: {
-    DISCORD_BOT_TOKEN: "hash-discord",
-    SLACK_BOT_TOKEN: "hash-slack-bot",
-    SLACK_APP_TOKEN: "hash-slack-app",
-    TELEGRAM_BOT_TOKEN: "hash-telegram",
-  },
 });
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
@@ -516,7 +533,7 @@ runner.runCapture = (command) => {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
     if (sandboxExecCurl !== null) return sandboxExecCurl;
   }
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   return "";
 };
 registry.registerSandbox = (entry) => {
@@ -533,7 +550,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  const command = _n(args[1][1]);
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
   const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
@@ -620,11 +639,6 @@ const { createSandbox } = require(${onboardPath});
       const channels = JSON.parse(Buffer.from(channelsLine.split("=")[1], "base64").toString());
       assert.deepEqual(channels, ["discord", "slack"]);
       assert.deepEqual(payload.registerCalls[0]?.messagingChannels, ["discord", "slack"]);
-      assert.deepEqual(payload.registerCalls[0]?.providerCredentialHashes, {
-        DISCORD_BOT_TOKEN: "hash-discord",
-        SLACK_BOT_TOKEN: "hash-slack-bot",
-        SLACK_APP_TOKEN: "hash-slack-app",
-      });
     },
   );
 
@@ -665,7 +679,6 @@ registry.registerSandbox({
   name: "my-assistant",
   messagingChannels: ["telegram"],
   disabledChannels: ["telegram"],
-  providerCredentialHashes: { TELEGRAM_BOT_TOKEN: "hash-telegram" },
 });
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
@@ -681,7 +694,7 @@ runner.runCapture = (command) => {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
     if (sandboxExecCurl !== null) return sandboxExecCurl;
   }
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   return "";
 };
 registry.registerSandbox = (entry) => {
@@ -698,7 +711,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  const command = _n(args[1][1]);
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
   const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
@@ -784,6 +799,334 @@ const { createSandbox } = require(${onboardPath});
         ["telegram"],
         "registry.disabledChannels must round-trip through the rebuild",
       );
+    },
+  );
+
+  it(
+    "bakes WhatsApp into the sandbox image without bridge providers when no messaging tokens are set",
+    { timeout: 60_000 },
+    async () => {
+      const repoRoot = path.join(import.meta.dirname, "..");
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "nemoclaw-onboard-tokenless-whatsapp-"),
+      );
+      try {
+        const fakeBin = path.join(tmpDir, "bin");
+        const scriptPath = path.join(tmpDir, "tokenless-whatsapp.js");
+        const onboardPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "onboard.js"));
+        const runnerPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "runner.js"));
+        const registryPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "state", "registry.js"),
+        );
+        const preflightPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "onboard", "preflight.js"),
+        );
+        const credentialsPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "credentials", "store.js"),
+        );
+
+        fs.mkdirSync(fakeBin, { recursive: true });
+        fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
+          mode: 0o755,
+        });
+
+        const script = String.raw`
+const runner = require(${runnerPath});
+const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
+const registry = require(${registryPath});
+const preflight = require(${preflightPath});
+const credentials = require(${credentialsPath});
+const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+
+const commands = [];
+const registerCalls = [];
+runner.run = (command, opts = {}) => {
+  const normalized = _n(command);
+  commands.push({ command: normalized, env: opts.env || null });
+  if (normalized.includes("provider get")) return { status: 1 };
+  return { status: 0 };
+};
+runner.runCapture = (command) => {
+  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox list")) return "my-assistant Ready";
+  {
+    const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
+    if (sandboxExecCurl !== null) return sandboxExecCurl;
+  }
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
+  return "";
+};
+registry.registerSandbox = (entry) => {
+  registerCalls.push(entry);
+  return true;
+};
+registry.updateSandbox = () => true;
+registry.setDefault = () => true;
+registry.removeSandbox = () => true;
+preflight.checkPortAvailable = async () => ({ ok: true });
+credentials.prompt = async () => "";
+
+childProcess.spawn = (...args) => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
+  const entry = { command, env: args[2]?.env || null };
+  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  if (dockerfileMatch) {
+    try {
+      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+    } catch (error) {
+      entry.dockerfileReadError = String(error);
+    }
+  }
+  commands.push(entry);
+  process.nextTick(() => {
+    child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
+    child.emit("close", 0);
+  });
+  return child;
+};
+
+const { createSandbox } = require(${onboardPath});
+
+(async () => {
+  process.env.OPENSHELL_GATEWAY = "nemoclaw";
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("DISCORD_") || key.startsWith("SLACK_") || key.startsWith("TELEGRAM_")) {
+      delete process.env[key];
+    }
+  }
+  const sandboxName = await createSandbox(
+    null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["whatsapp"],
+  );
+  console.log(JSON.stringify({ sandboxName, commands, registerCalls }));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`;
+        fs.writeFileSync(scriptPath, script);
+
+        const result = spawnSync(process.execPath, [scriptPath], {
+          cwd: repoRoot,
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            HOME: tmpDir,
+            PATH: `${fakeBin}:${process.env.PATH || ""}`,
+            NEMOCLAW_NON_INTERACTIVE: "1",
+          },
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        const payloadLine = result.stdout
+          .trim()
+          .split("\n")
+          .slice()
+          .reverse()
+          .find((line) => line.startsWith("{") && line.endsWith("}"));
+        assert.ok(payloadLine, `expected JSON payload in stdout:\n${result.stdout}`);
+        const payload = JSON.parse(payloadLine);
+
+        const providerMutationCommands = payload.commands.filter((entry: CommandEntry) =>
+          /\bprovider (create|update)\b/.test(entry.command),
+        );
+        assert.equal(
+          providerMutationCommands.length,
+          0,
+          "QR-only channel selection must not create bridge providers",
+        );
+
+        const createCommand = payload.commands.find((entry: CommandEntry) =>
+          entry.command.includes("sandbox create"),
+        );
+        assert.ok(createCommand, "expected sandbox create command");
+        assert.equal(createCommand.dockerfileReadError, undefined);
+        assert.doesNotMatch(createCommand.command, /--provider \S+-bridge\b/);
+
+        const channelsLine = createCommand.dockerfileContent
+          ?.split("\n")
+          .find((line: string) => line.startsWith("ARG NEMOCLAW_MESSAGING_CHANNELS_B64="));
+        assert.ok(channelsLine, "expected messaging build arg in Dockerfile");
+        const channels = JSON.parse(
+          Buffer.from(channelsLine.split("=")[1], "base64").toString(),
+        );
+        assert.deepEqual(channels, ["whatsapp"]);
+        assert.deepEqual(payload.registerCalls[0]?.messagingChannels, ["whatsapp"]);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "drops WhatsApp from the rebuilt image when the registry marks it disabled",
+    { timeout: 60_000 },
+    async () => {
+      const repoRoot = path.join(import.meta.dirname, "..");
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "nemoclaw-onboard-disabled-whatsapp-"),
+      );
+      try {
+        const fakeBin = path.join(tmpDir, "bin");
+        const scriptPath = path.join(tmpDir, "disabled-whatsapp.js");
+        const onboardPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "onboard.js"));
+        const runnerPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "runner.js"));
+        const registryPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "state", "registry.js"),
+        );
+        const preflightPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "onboard", "preflight.js"),
+        );
+        const credentialsPath = JSON.stringify(
+          path.join(repoRoot, "dist", "lib", "credentials", "store.js"),
+        );
+
+        fs.mkdirSync(fakeBin, { recursive: true });
+        fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
+          mode: 0o755,
+        });
+
+        const script = String.raw`
+const runner = require(${runnerPath});
+const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
+const registry = require(${registryPath});
+const preflight = require(${preflightPath});
+const credentials = require(${credentialsPath});
+const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+
+registry.registerSandbox({
+  name: "my-assistant",
+  disabledChannels: ["whatsapp"],
+});
+
+const commands = [];
+const registerCalls = [];
+runner.run = (command, opts = {}) => {
+  const normalized = _n(command);
+  commands.push({ command: normalized, env: opts.env || null });
+  if (normalized.includes("provider get")) return { status: 1 };
+  return { status: 0 };
+};
+runner.runCapture = (command) => {
+  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox list")) return "my-assistant Ready";
+  {
+    const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
+    if (sandboxExecCurl !== null) return sandboxExecCurl;
+  }
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
+  return "";
+};
+registry.registerSandbox = (entry) => {
+  registerCalls.push(entry);
+  return true;
+};
+registry.updateSandbox = () => true;
+registry.setDefault = () => true;
+registry.removeSandbox = () => true;
+preflight.checkPortAvailable = async () => ({ ok: true });
+credentials.prompt = async () => "";
+
+childProcess.spawn = (...args) => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.unref = () => {};
+  child.pid = 4242;
+  const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
+  const entry = { command, env: args[2]?.env || null };
+  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  if (dockerfileMatch) {
+    try {
+      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+    } catch (error) {
+      entry.dockerfileReadError = String(error);
+    }
+  }
+  commands.push(entry);
+  process.nextTick(() => {
+    child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
+    child.emit("close", 0);
+  });
+  return child;
+};
+
+const { createSandbox } = require(${onboardPath});
+
+(async () => {
+  process.env.OPENSHELL_GATEWAY = "nemoclaw";
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("DISCORD_") || key.startsWith("SLACK_") || key.startsWith("TELEGRAM_")) {
+      delete process.env[key];
+    }
+  }
+  const sandboxName = await createSandbox(
+    null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["whatsapp"],
+  );
+  console.log(JSON.stringify({ sandboxName, commands, registerCalls }));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`;
+        fs.writeFileSync(scriptPath, script);
+
+        const result = spawnSync(process.execPath, [scriptPath], {
+          cwd: repoRoot,
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            HOME: tmpDir,
+            PATH: `${fakeBin}:${process.env.PATH || ""}`,
+            NEMOCLAW_NON_INTERACTIVE: "1",
+          },
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        const payloadLine = result.stdout
+          .trim()
+          .split("\n")
+          .slice()
+          .reverse()
+          .find((line) => line.startsWith("{") && line.endsWith("}"));
+        assert.ok(payloadLine, `expected JSON payload in stdout:\n${result.stdout}`);
+        const payload = JSON.parse(payloadLine);
+
+        const createCommand = payload.commands.find((entry: CommandEntry) =>
+          entry.command.includes("sandbox create"),
+        );
+        assert.ok(createCommand, "expected sandbox create command");
+        assert.equal(createCommand.dockerfileReadError, undefined);
+
+        const channelsLine = createCommand.dockerfileContent
+          ?.split("\n")
+          .find((line: string) => line.startsWith("ARG NEMOCLAW_MESSAGING_CHANNELS_B64="));
+        assert.ok(channelsLine, "expected messaging build arg in Dockerfile");
+        const channels = JSON.parse(
+          Buffer.from(channelsLine.split("=")[1], "base64").toString(),
+        );
+        assert.deepEqual(channels, [], "disabled QR channel must not be baked into the image");
+        assert.deepEqual(
+          payload.registerCalls[0]?.messagingChannels,
+          ["whatsapp"],
+          "registry.messagingChannels must keep the disabled QR channel so `channels start` can recover it (mirrors #3381)",
+        );
+        assert.deepEqual(
+          payload.registerCalls[0]?.disabledChannels,
+          ["whatsapp"],
+          "registry.disabledChannels must round-trip through the rebuild",
+        );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
     },
   );
 
@@ -897,7 +1240,7 @@ runner.runCapture = (command) => {
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   // All messaging providers already exist in gateway
   if (_n(command).includes("provider get")) return "Provider: exists";
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   return "";
 };
 registry.getSandbox = () => ({ name: "my-assistant", gpuEnabled: false });
@@ -908,6 +1251,7 @@ const { createSandbox } = require(${onboardPath});
   process.env.OPENSHELL_GATEWAY = "nemoclaw";
   process.env.DISCORD_BOT_TOKEN = "test-discord-token";
   process.env.SLACK_BOT_TOKEN = "xoxb-test-slack-token";
+  process.env.SLACK_APP_TOKEN = "xapp-test-slack-token";
   const sandboxName = await createSandbox(null, "gpt-5.4", "nvidia-prod", null, "my-assistant");
   console.log(JSON.stringify({ sandboxName, commands }));
 })().catch((error) => {
@@ -1011,7 +1355,7 @@ runner.runCapture = (command) => {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
     if (sandboxExecCurl !== null) return sandboxExecCurl;
   }
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   return "";
 };
 registry.registerSandbox = () => true;
@@ -1025,7 +1369,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  commands.push({ command: _n(args[1][1]), env: args[2]?.env || null });
+  child.unref = () => {};
+  child.pid = 4242;
+  commands.push({ command: _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]), env: args[2]?.env || null });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -1146,7 +1492,7 @@ runner.runCapture = (command) => {
     const sandboxExecCurl = require(${onboardScriptMocksPath}).mockSandboxExecCurl(command);
     if (sandboxExecCurl !== null) return sandboxExecCurl;
   }
-  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
+  if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   return "";
 };
 registry.registerSandbox = () => true;
@@ -1160,7 +1506,9 @@ childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  commands.push({ command: _n(args[1][1]), env: args[2]?.env || null });
+  child.unref = () => {};
+  child.pid = 4242;
+  commands.push({ command: _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]), env: args[2]?.env || null });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -1241,7 +1589,6 @@ const { createSandbox } = require(${onboardPath});
       const scriptPath = path.join(tmpDir, "messaging-noninteractive.js");
       const onboardPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "onboard.js"));
       const runnerPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "runner.js"));
-      const httpProbePath = JSON.stringify(path.join(repoRoot, "dist", "lib", "adapters", "http", "probe.js"));
 
       fs.mkdirSync(fakeBin, { recursive: true });
       fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
@@ -1254,17 +1601,13 @@ const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "")
 runner.run = () => ({ status: 0 });
 runner.runCapture = () => "";
 
-// Stub the Telegram reachability probe so this test doesn't make a real network
-// call — on networks where api.telegram.org is blocked, the non-interactive
-// preflight would otherwise abort the test.
-const httpProbe = require(${httpProbePath});
-httpProbe.runCurlProbe = () => ({
+// Stub the manifest-driven Telegram reachability hook so this test does not
+// make a real network call.
+global.fetch = async () => ({
   ok: true,
-  httpStatus: 200,
-  curlStatus: 0,
-  body: '{"ok":true,"result":{"id":1,"is_bot":true}}',
-  stderr: "",
-  message: "",
+  status: 200,
+  json: async () => ({ ok: true, result: { id: 1, is_bot: true } }),
+  text: async () => "",
 });
 
 const { setupMessagingChannels } = require(${onboardPath});
@@ -1273,6 +1616,8 @@ const { setupMessagingChannels } = require(${onboardPath});
   // Only set telegram and slack tokens — discord should be absent
   process.env.TELEGRAM_BOT_TOKEN = "123456:ABC-test-telegram-token";
   process.env.SLACK_BOT_TOKEN = "xoxb-test-slack-token";
+  process.env.SLACK_APP_TOKEN = "xapp-test-slack-app-token";
+  process.env.NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION = "1";
   const result = await setupMessagingChannels();
   console.log(JSON.stringify(result));
 })().catch((error) => {
@@ -1301,6 +1646,91 @@ const { setupMessagingChannels } = require(${onboardPath});
       assert.ok(channels.includes("telegram"), "expected telegram in returned channels");
       assert.ok(channels.includes("slack"), "expected slack in returned channels");
       assert.ok(!channels.includes("discord"), "discord should not be in returned channels");
+    },
+  );
+
+  it(
+    "non-interactive setupMessagingChannels drops Slack when live Slack API validation rejects the token",
+    { timeout: 60_000 },
+    async () => {
+      const repoRoot = path.join(import.meta.dirname, "..");
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "nemoclaw-onboard-messaging-slack-live-reject-"),
+      );
+      const fakeBin = path.join(tmpDir, "bin");
+      const scriptPath = path.join(tmpDir, "messaging-slack-live-reject.js");
+      const onboardPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "onboard.js"));
+      const runnerPath = JSON.stringify(path.join(repoRoot, "dist", "lib", "runner.js"));
+      const httpProbePath = JSON.stringify(path.join(repoRoot, "dist", "lib", "adapters", "http", "probe.js"));
+
+      fs.mkdirSync(fakeBin, { recursive: true });
+      fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
+        mode: 0o755,
+      });
+
+      const script = String.raw`
+const runner = require(${runnerPath});
+const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
+runner.run = () => ({ status: 0 });
+runner.runCapture = () => "";
+
+const httpProbe = require(${httpProbePath});
+httpProbe.runCurlProbe = (argv) => {
+  const url = argv[argv.length - 1] || "";
+  if (String(url).includes("auth.test")) {
+    return {
+      ok: true,
+      httpStatus: 200,
+      curlStatus: 0,
+      body: '{"ok":false,"error":"invalid_auth"}',
+      stderr: "",
+      message: "",
+    };
+  }
+  return {
+    ok: true,
+    httpStatus: 200,
+    curlStatus: 0,
+    body: '{"ok":true}',
+    stderr: "",
+    message: "",
+  };
+};
+
+const { setupMessagingChannels } = require(${onboardPath});
+
+(async () => {
+  delete process.env.TELEGRAM_BOT_TOKEN;
+  delete process.env.DISCORD_BOT_TOKEN;
+  process.env.SLACK_BOT_TOKEN = "xoxb-fake-bot-token";
+  process.env.SLACK_APP_TOKEN = "xapp-fake-app-token";
+  const result = await setupMessagingChannels();
+  console.log(JSON.stringify(result));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`;
+      fs.writeFileSync(scriptPath, script);
+
+      const result = spawnSync(process.execPath, [scriptPath], {
+        cwd: repoRoot,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: tmpDir,
+          PATH: `${fakeBin}:${process.env.PATH || ""}`,
+          NEMOCLAW_NON_INTERACTIVE: "1",
+        },
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      const channels = parseStdoutJson<string[]>(result.stdout);
+
+      assert.ok(Array.isArray(channels), "expected an array return value");
+      assert.ok(!channels.includes("slack"), "Slack should be dropped after API rejection");
+      assert.doesNotMatch(result.stdout, /xoxb-fake-bot-token/);
+      assert.doesNotMatch(result.stderr, /xoxb-fake-bot-token/);
     },
   );
 
@@ -1335,6 +1765,7 @@ const { setupMessagingChannels } = require(${onboardPath});
   delete process.env.TELEGRAM_BOT_TOKEN;
   delete process.env.DISCORD_BOT_TOKEN;
   delete process.env.SLACK_BOT_TOKEN;
+  delete process.env.SLACK_APP_TOKEN;
   const result = await setupMessagingChannels();
   console.log(JSON.stringify(result));
 })().catch((error) => {
@@ -1355,6 +1786,7 @@ const { setupMessagingChannels } = require(${onboardPath});
           TELEGRAM_BOT_TOKEN: "",
           DISCORD_BOT_TOKEN: "",
           SLACK_BOT_TOKEN: "",
+          SLACK_APP_TOKEN: "",
         },
       });
 
@@ -1572,12 +2004,9 @@ const { setupMessagingChannels, MESSAGING_CHANNELS } = require(${onboardPath});
         !out.result.includes("slack"),
         `slack should have been dropped after invalid app token; got ${JSON.stringify(out.result)}`,
       );
-      // Bot token is persisted before the app-token prompt — that's fine, the
-      // user can retry later and the pre-saved bot token will light up as
-      // "already configured" on the next onboard.
       assert.ok(
-        out.saveCalls.some((c: { key: string }) => c.key === "SLACK_BOT_TOKEN"),
-        `SLACK_BOT_TOKEN should have been persisted (valid format); saveCalls=${JSON.stringify(out.saveCalls)}`,
+        !out.saveCalls.some((c: { key: string }) => c.key === "SLACK_BOT_TOKEN"),
+        `SLACK_BOT_TOKEN should NOT be persisted until the app token also passes; saveCalls=${JSON.stringify(out.saveCalls)}`,
       );
       assert.ok(
         !out.saveCalls.some((c: { key: string }) => c.key === "SLACK_APP_TOKEN"),
