@@ -11,7 +11,8 @@ import { describe, expect, it } from "vitest";
 const START_SCRIPT = path.join(import.meta.dirname, "..", "scripts", "nemoclaw-start.sh");
 
 function extractShellFunctionFromSource(src: string, name: string): string {
-  const match = src.match(new RegExp(`${name}\\(\\) \\{([\\s\\S]*?)^\\}`, "m"));
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = src.match(new RegExp(`${escapedName}\\(\\) \\{([\\s\\S]*?)^\\}`, "m"));
   if (!match) {
     throw new Error(`Expected ${name} in scripts/nemoclaw-start.sh`);
   }
