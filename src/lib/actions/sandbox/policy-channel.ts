@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-
 import fs from "node:fs";
 import path from "node:path";
 
@@ -13,6 +12,7 @@ import {
   type ChannelManifest,
   createBuiltInChannelManifestRegistry,
   createBuiltInMessagingHookRegistry,
+  createBuiltInRenderTemplateResolver,
   getMessagingManifestAvailabilityContext,
   MessagingHostStateApplier,
   MessagingSetupApplier,
@@ -36,7 +36,8 @@ const onboardProviders = require("../../onboard/providers");
 import { filterSetupPolicyPresetsForAgent } from "../../onboard/agent-policy-presets";
 import * as policies from "../../policy";
 
-const onboardSession = require("../../state/onboard-session") as typeof import("../../state/onboard-session");
+const onboardSession =
+  require("../../state/onboard-session") as typeof import("../../state/onboard-session");
 
 import { runOpenshell } from "../../adapters/openshell/runtime";
 import {
@@ -56,10 +57,7 @@ import {
   persistChannelTokens,
 } from "../../sandbox/channels";
 import * as registry from "../../state/registry";
-import {
-  isDockerRuntimeDown,
-  printDockerRuntimeDownGuidance,
-} from "./gateway-failure-classifier";
+import { isDockerRuntimeDown, printDockerRuntimeDownGuidance } from "./gateway-failure-classifier";
 import { refreshSandboxPolicyContextFile } from "./policy-context-refresh";
 import { executeSandboxCommand, executeSandboxExecCommand } from "./process-recovery";
 import { rebuildSandbox } from "./rebuild";
@@ -443,9 +441,7 @@ async function checkChannelAddConflict(
       );
       process.exit(1);
     }
-    const answer = (
-      await askPrompt("  Continue without a completed conflict check? [y/N]: ")
-    )
+    const answer = (await askPrompt("  Continue without a completed conflict check? [y/N]: "))
       .trim()
       .toLowerCase();
     if (answer === "y" || answer === "yes") return true;
@@ -471,6 +467,65 @@ async function checkChannelAddConflict(
   if (isNonInteractive()) {
     console.error(
       `  Aborting: resolve the messaging channel conflict above, run \`${CLI_NAME} <sandbox> channels remove ${channelName}\` on the other sandbox, or re-run with --force.`,
+    );
+    process.exit(1);
+  }
+  const answer = (await askPrompt("  Continue anyway? [y/N]: ")).trim().toLowerCase();
+  if (answer === "y" || answer === "yes") return true;
+  console.log("  Aborting channel add.");
+  return false;
+}
+
+// Gateway-scoped Slack Socket Mode conflict (#4953): even with a distinct Slack
+// app/token, only one sandbox per OpenShell gateway reliably receives Socket
+// Mode events. Runs AFTER `checkChannelAddConflict` so the credential axis —
+// which catches a *shared* token and stays accurate across gateways — is
+// reported first; this axis then catches the distinct-token, same-gateway case
+// instead of letting it become a silent black hole. Returns true to PROCEED,
+// false to abort. Fail-soft: a detection error must not crash the add or bypass
+// `--force`, so it is swallowed (the credential axis already ran its guarded
+// check). Only meaningful for Slack; other channels proceed unchanged.
+async function checkSlackSocketModeGatewayConflict(
+  sandboxName: string,
+  channelName: string,
+  force: boolean,
+): Promise<boolean> {
+  if (channelName !== "slack") return true;
+  let conflictMessages: string[] = [];
+  try {
+    const applier = require("../../messaging/applier") as typeof import("../../messaging/applier");
+    const { BASE_GATEWAY_NAME } =
+      require("../../onboard/gateway-binding") as typeof import("../../onboard/gateway-binding");
+    // `channels add` registers the Slack provider on the default `nemoclaw`
+    // gateway — applyChannelAddToGatewayAndRegistry → recoverNamedGatewayRuntime
+    // selects `nemoclaw` regardless of the sandbox's recorded gateway. Detect
+    // conflicts on the gateway the add actually mutates so the check matches the
+    // provider registration and cannot leave a false negative (#4953).
+    const gatewayName = BASE_GATEWAY_NAME;
+    conflictMessages = applier
+      .findSlackSocketModeGatewayConflicts(
+        sandboxName,
+        gatewayName,
+        registry.listSandboxes().sandboxes,
+      )
+      .map(({ sandbox }) => applier.formatSlackSocketModeConflictMessage(sandbox));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`  ${YW}⚠${R} Could not verify Slack Socket Mode gateway conflicts: ${message}`);
+    return true;
+  }
+  if (conflictMessages.length === 0) return true;
+
+  for (const message of conflictMessages) {
+    console.log(`  ${YW}⚠${R} ${message}`);
+  }
+  if (force) {
+    console.log("  --force: proceeding despite the Slack Socket Mode gateway conflict above.");
+    return true;
+  }
+  if (isNonInteractive()) {
+    console.error(
+      `  Aborting: only one sandbox per gateway can receive Slack Socket Mode events. Run \`${CLI_NAME} <sandbox> channels remove slack\` on the other sandbox, onboard this sandbox on a separate gateway (set NEMOCLAW_GATEWAY_PORT), or re-run with --force.`,
     );
     process.exit(1);
   }
@@ -663,8 +718,8 @@ async function promptAndRebuild(sandboxName: string, actionDesc: string): Promis
 // and emit `[<name>] [default]` startup breadcrumbs in /tmp/gateway.log.
 // WhatsApp is QR-only (no host-side bridge process at this point), and WeChat
 // is recorded under the `openclaw-weixin` channel id with its own per-account
-// metadata flow seeded by seed-wechat-accounts.py — neither match the probe
-// shape and would produce false-negative warnings here.
+// metadata flow seeded by the manifest post-agent-install hook — neither match
+// the probe shape and would produce false-negative warnings here.
 const OPENCLAW_BRIDGE_VERIFIABLE_CHANNELS = new Set(["telegram", "discord", "slack"]);
 
 // Probe OpenClaw runtime state for a freshly added messaging channel. Runs
@@ -740,9 +795,7 @@ function verifyChannelBridgeAfterRebuild(sandboxName: string, channelName: strin
     ),
   );
   if (credentialWarnings.length > 0) {
-    console.log(
-      `  ${YW}⚠${R} '${channelName}' bridge logged credential/startup warnings:`,
-    );
+    console.log(`  ${YW}⚠${R} '${channelName}' bridge logged credential/startup warnings:`);
     for (const line of credentialWarnings.slice(0, 3)) {
       console.log(`    ${line}`);
     }
@@ -760,9 +813,7 @@ function verifyChannelBridgeAfterRebuild(sandboxName: string, channelName: strin
     /\bstarting provider\b|\bprovider ready\b/.test(line),
   );
   if (positiveStartup) {
-    console.log(
-      `  ${G}✓${R} '${channelName}' bridge startup detected in sandbox runtime log.`,
-    );
+    console.log(`  ${G}✓${R} '${channelName}' bridge startup detected in sandbox runtime log.`);
     if (channelName === "telegram") {
       printTelegramDirectMessageAllowlistWarning(channelBlock, console.log, `${YW}⚠${R}`);
     }
@@ -784,6 +835,7 @@ async function planSandboxChannelAdd(
   const planner = new MessagingWorkflowPlanner(
     messagingManifestRegistry,
     createBuiltInMessagingHookRegistry(),
+    createBuiltInRenderTemplateResolver(),
   );
   const availableChannels = availableManifestChannelsForAgent(agent);
   const supportedChannelIds = availableChannels.map((manifest) => manifest.id);
@@ -882,14 +934,18 @@ function assertAddChannelPlanActive(
   const channelPlan = plan.channels.find((channel) => channel.channelId === manifest.id);
   if (channelPlan?.active) return channelPlan;
 
-  const missing = channelPlan?.inputs.filter((input) => input.required && !inputAvailable(input)) ?? [];
+  const missing =
+    channelPlan?.inputs.filter((input) => input.required && !inputAvailable(input)) ?? [];
   if (missing.length > 0) {
     console.error(
       `  Missing required input(s) for channel '${manifest.id}': ${missing
         .map(formatMissingInput)
         .join(", ")}.`,
     );
-    if (manifest.auth.mode === "host-qr" && getMessagingToken(manifest.credentials[0]?.providerEnvKey)) {
+    if (
+      manifest.auth.mode === "host-qr" &&
+      getMessagingToken(manifest.credentials[0]?.providerEnvKey)
+    ) {
       console.error(
         `  Run '${CLI_NAME} ${sandboxName} channels remove ${manifest.id}' then '${CLI_NAME} ${sandboxName} channels add ${manifest.id}' to capture fresh account metadata.`,
       );
@@ -918,7 +974,7 @@ function hydrateAddChannelEnvFromSession(sandboxName: string, channelId: string)
   if (channelId !== "wechat") return;
   const savedSession = safeLoadOnboardSession();
   const savedWechat =
-    savedSession?.sandboxName === sandboxName ? savedSession.wechatConfig ?? null : null;
+    savedSession?.sandboxName === sandboxName ? (savedSession.wechatConfig ?? null) : null;
   if (!savedWechat) return;
   if (savedWechat.accountId && !process.env.WECHAT_ACCOUNT_ID) {
     process.env.WECHAT_ACCOUNT_ID = savedWechat.accountId;
@@ -960,7 +1016,9 @@ function persistManifestMessagingConfig(sandboxName: string, manifest: ChannelMa
   }
 }
 
-function readManifestMessagingConfigFromEnv(manifest: ChannelManifest): MessagingChannelConfig | null {
+function readManifestMessagingConfigFromEnv(
+  manifest: ChannelManifest,
+): MessagingChannelConfig | null {
   const result: MessagingChannelConfig = {};
   for (const input of manifest.inputs) {
     if (input.kind !== "config" || !input.envKey) continue;
@@ -1064,6 +1122,11 @@ export async function addSandboxChannel(
   const plan = await planSandboxChannelAdd(sandboxName, canonical, agent);
   const acquired = collectManifestCredentials(manifest);
   if (!(await checkChannelAddConflict(sandboxName, canonical, acquired, force))) {
+    return; // user aborted; nothing registered or widened
+  }
+  // Credential axis passed; now the gateway-scoped Slack Socket Mode axis (#4953)
+  // catches the distinct-token, same-gateway case the credential check cannot.
+  if (!(await checkSlackSocketModeGatewayConflict(sandboxName, canonical, force))) {
     return; // user aborted; nothing registered or widened
   }
   assertAddChannelPlanActive(sandboxName, manifest, plan);
@@ -1401,8 +1464,7 @@ export async function removeSandboxChannel(
     sessionForSandbox = null;
   }
   const sessionPolicyPresets =
-    sessionForSandbox?.sandboxName === sandboxName &&
-    Array.isArray(sessionForSandbox.policyPresets)
+    sessionForSandbox?.sandboxName === sandboxName && Array.isArray(sessionForSandbox.policyPresets)
       ? sessionForSandbox.policyPresets
       : [];
   const hasChannelResidue =
@@ -1419,7 +1481,11 @@ export async function removeSandboxChannel(
   // when the registry/policy show no residue — `channels remove` on a
   // never-configured/already-clean sandbox must remain a quiet no-op even
   // when the sandbox is stopped (#4001 review).
-  if (isQrChannel && hasChannelResidue && !clearSandboxChannelDurableState(sandboxName, canonical)) {
+  if (
+    isQrChannel &&
+    hasChannelResidue &&
+    !clearSandboxChannelDurableState(sandboxName, canonical)
+  ) {
     console.error(
       `  Refusing to proceed: '${canonical}' session state is still inside the sandbox.`,
     );

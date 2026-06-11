@@ -214,9 +214,7 @@ describe("gateway drift preflight for maintenance actions", () => {
 
     expect(backupSandboxStateSpy).toHaveBeenCalledWith("alpha");
     expect(backupSandboxStateSpy).not.toHaveBeenCalledWith("beta");
-    expect(logSpy.mock.calls.flat().join("\n")).toContain(
-      "Skipping 'beta' (not running)",
-    );
+    expect(logSpy.mock.calls.flat().join("\n")).toContain("Skipping 'beta' (not running)");
   });
 
   it("backup-all fails closed on protobuf mismatch instead of treating sandboxes as stopped", async () => {
@@ -267,6 +265,8 @@ describe("gateway drift preflight for maintenance actions", () => {
       [{ name: "alpha", provider: "nvidia-prod", model: "nemotron" }],
       new Set(["alpha"]),
       expect.any(Function),
+      // #5026: the running NemoClaw build is passed so image drift is detected.
+      expect.objectContaining({ currentNemoclawVersion: expect.any(String) }),
     );
   });
 

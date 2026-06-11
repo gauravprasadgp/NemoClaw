@@ -125,8 +125,10 @@ function arrangeRegistry(opts: { current: SandboxEntry; others?: SandboxEntry[] 
 
 function loggedText(): string {
   const lines: string[] = [];
-  for (const call of (logSpy.mock.calls as unknown[][]) ?? []) lines.push(call.map(String).join(" "));
-  for (const call of (errSpy.mock.calls as unknown[][]) ?? []) lines.push(call.map(String).join(" "));
+  for (const call of (logSpy.mock.calls as unknown[][]) ?? [])
+    lines.push(call.map(String).join(" "));
+  for (const call of (errSpy.mock.calls as unknown[][]) ?? [])
+    lines.push(call.map(String).join(" "));
   return lines.join("\n");
 }
 
@@ -245,7 +247,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("interactive matching-token conflict: warns, user continues, add proceeds", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("y");
@@ -263,7 +269,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("interactive matching-token conflict: user aborts, nothing is mutated", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("n");
@@ -279,7 +289,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("interactive matching-token conflict: empty answer (default N) aborts", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue(""); // bare Enter -> default No
@@ -294,7 +308,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("non-interactive matching-token conflict: aborts with exit(1) and guidance", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     process.env.NEMOCLAW_NON_INTERACTIVE = "1";
@@ -318,7 +336,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("--force bypasses the conflict even in non-interactive mode", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     process.env.NEMOCLAW_NON_INTERACTIVE = "1";
@@ -354,9 +376,14 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("different hash on the other sandbox is NOT a conflict (no warning, add proceeds)", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [
-        { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: hashCredential("a-completely-different-token") as string },
-      ])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          {
+            providerEnvKey: "TELEGRAM_BOT_TOKEN",
+            credentialHash: hashCredential("a-completely-different-token") as string,
+          },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("n"); // would abort IF prompted; proves no prompt happens
@@ -374,7 +401,9 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   // Scenario 6
   it("idempotent same-sandbox re-add does not self-conflict", async () => {
     arrangeRegistry({
-      current: makePlanEntry("alpha", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }]),
+      current: makePlanEntry("alpha", "telegram", [
+        { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+      ]),
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("n"); // would abort IF prompted
@@ -393,7 +422,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("--dry-run never runs the conflict check or touches credentials", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
 
     await addSandboxChannel("alpha", { channel: "telegram", dryRun: true });
@@ -415,7 +448,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     const wechatHash = hashCredential(wechatToken) as string;
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "wechat", [{ providerEnvKey: "WECHAT_BOT_TOKEN", credentialHash: wechatHash }])],
+      others: [
+        makePlanEntry("bob", "wechat", [
+          { providerEnvKey: "WECHAT_BOT_TOKEN", credentialHash: wechatHash },
+        ]),
+      ],
     });
     // The hook planner skips non-interactive host-QR enrollment, but the
     // conflict guard should still see a cached WeChat credential.
@@ -455,7 +492,9 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
       others: [
-        makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }]),
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
         // Legacy entry with NO messagingChannels field — backfill probes the
         // (alive) gateway, gets "absent" for every provider, then writes
         // messagingChannels:[] for it. We make THAT write throw to genuinely
@@ -537,7 +576,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("never prints the raw token value in any conflict output (proceed path)", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("y");
@@ -553,7 +596,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   it("non-interactive abort path also keeps the raw token out of output", async () => {
     arrangeRegistry({
       current: { name: "alpha", messagingChannels: [] },
-      others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH }])],
+      others: [
+        makePlanEntry("bob", "telegram", [
+          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
+        ]),
+      ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     process.env.NEMOCLAW_NON_INTERACTIVE = "1";
@@ -574,7 +621,11 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
       current: { name: "alpha", messagingChannels: [] },
       // only bot token stored — app token unknown → conservative unknown-token OR
       // matching-token if bot token matches; test verifies the conflict is surfaced.
-      others: [makePlanEntry("bob", "slack", [{ providerEnvKey: "SLACK_BOT_TOKEN", credentialHash: slackBotHash }])],
+      others: [
+        makePlanEntry("bob", "slack", [
+          { providerEnvKey: "SLACK_BOT_TOKEN", credentialHash: slackBotHash },
+        ]),
+      ],
     });
     getCredentialMock.mockImplementation((key: string) => {
       if (key === "SLACK_BOT_TOKEN") return slackBot;
@@ -590,6 +641,132 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     expect(text).toContain("same slack credential"); // matching-token wording
     expect(text).not.toContain(slackBot);
     expect(text).not.toContain(slackApp);
+    expect(upsertMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("slack: a second sandbox on the SAME gateway is blocked even with a different token (#4953)", async () => {
+    const slackBot = "xoxb-alpha-bot-token";
+    const slackApp = "xapp-alpha-app-token";
+    arrangeRegistry({
+      current: { name: "alpha", messagingChannels: [] } as SandboxEntry,
+      // bob holds Slack on the default gateway with entirely different tokens —
+      // the credential axis would NOT flag this, but the gateway axis must.
+      others: [
+        makePlanEntry("bob", "slack", [
+          {
+            providerEnvKey: "SLACK_BOT_TOKEN",
+            credentialHash: hashCredential("xoxb-bob-bot") as string,
+          },
+          {
+            providerEnvKey: "SLACK_APP_TOKEN",
+            credentialHash: hashCredential("xapp-bob-app") as string,
+          },
+        ]),
+      ],
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
+    );
+    promptMock.mockResolvedValue("n"); // decline the conflict prompt
+
+    await addSandboxChannel("alpha", { channel: "slack" });
+
+    const text = loggedText();
+    expect(text).toContain("Slack Socket Mode is already enabled for sandbox 'bob'");
+    expect(text).not.toContain("same slack credential"); // gateway axis, not a token match
+    expect(text).not.toContain(slackBot);
+    expect(text).not.toContain(slackApp);
+    expect(conflictPromptShown()).toBe(true);
+    expect(upsertMock).not.toHaveBeenCalled(); // aborted before registering
+  });
+
+  it("slack: shared token on the same gateway reports the credential conflict first (#4953)", async () => {
+    // The credential axis runs before the gateway axis, so a shared Slack token
+    // surfaces the gateway-independent "same slack credential" warning (more
+    // actionable: it conflicts even after moving to another gateway) instead of
+    // only the same-gateway remediation.
+    const slackBot = "xoxb-shared-bot-token";
+    const slackApp = "xapp-shared-app-token";
+    arrangeRegistry({
+      current: { name: "alpha", messagingChannels: [] } as SandboxEntry,
+      others: [
+        makePlanEntry("bob", "slack", [
+          { providerEnvKey: "SLACK_BOT_TOKEN", credentialHash: hashCredential(slackBot) as string },
+          { providerEnvKey: "SLACK_APP_TOKEN", credentialHash: hashCredential(slackApp) as string },
+        ]),
+      ],
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
+    );
+    process.env.NEMOCLAW_NON_INTERACTIVE = "1";
+
+    await expect(addSandboxChannel("alpha", { channel: "slack" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    const text = loggedText();
+    expect(text).toContain("same slack credential"); // credential axis fired first
+    expect(text).not.toContain(slackBot);
+    expect(text).not.toContain(slackApp);
+    expect(exitMock).toHaveBeenCalledWith(1);
+    expect(upsertMock).not.toHaveBeenCalled();
+  });
+
+  it("slack: a second sandbox on a DIFFERENT gateway is not gateway-blocked (#4953)", async () => {
+    const bob = makePlanEntry("bob", "slack", [
+      {
+        providerEnvKey: "SLACK_BOT_TOKEN",
+        credentialHash: hashCredential("xoxb-bob-bot") as string,
+      },
+      {
+        providerEnvKey: "SLACK_APP_TOKEN",
+        credentialHash: hashCredential("xapp-bob-app") as string,
+      },
+    ]);
+    (bob as { gatewayName?: string }).gatewayName = "nemoclaw-9090";
+    arrangeRegistry({
+      current: { name: "alpha", messagingChannels: [] } as SandboxEntry,
+      others: [bob],
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN"
+        ? "xoxb-alpha-bot"
+        : key === "SLACK_APP_TOKEN"
+          ? "xapp-alpha-app"
+          : null,
+    );
+    promptMock.mockResolvedValue("n"); // would abort if any conflict prompt were shown
+
+    await addSandboxChannel("alpha", { channel: "slack" });
+
+    const text = loggedText();
+    expect(text).not.toContain("Slack Socket Mode is already enabled");
+    expect(conflictPromptShown()).toBe(false);
+    expect(upsertMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("slack: a gateway conflict-detection failure is fail-soft, not a crash (#4953)", async () => {
+    arrangeRegistry({ current: { name: "alpha", messagingChannels: [] } as SandboxEntry });
+    // Simulate a malformed registry read: listSandboxes throws. The Slack
+    // gateway lookup must swallow it (best-effort warning) rather than crash
+    // the add or bypass the downstream guarded credential check.
+    listSandboxesMock.mockImplementation(() => {
+      throw new Error("registry boom");
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN"
+        ? "xoxb-alpha-bot"
+        : key === "SLACK_APP_TOKEN"
+          ? "xapp-alpha-app"
+          : null,
+    );
+    promptMock.mockResolvedValue("y"); // proceed through any "could not verify" prompt
+
+    await addSandboxChannel("alpha", { channel: "slack" });
+
+    expect(loggedText()).toContain("Could not verify Slack Socket Mode gateway conflicts");
+    expect(exitMock).not.toHaveBeenCalled();
     expect(upsertMock).toHaveBeenCalledTimes(1);
   });
 });

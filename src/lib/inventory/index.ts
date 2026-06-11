@@ -85,7 +85,10 @@ export interface SandboxInventoryResult {
 export interface MessagingOverlap {
   channel: string;
   sandboxes: [string, string];
-  reason?: "matching-token" | "unknown-token";
+  // "slack-socket-mode-gateway": both sandboxes have Slack Socket Mode active on
+  // the same OpenShell gateway, so only one receives events (#4953) — distinct
+  // from the credential-sharing reasons, which catch a *shared* token.
+  reason?: "matching-token" | "unknown-token" | "slack-socket-mode-gateway";
 }
 
 export interface GatewayHealth {
@@ -114,10 +117,7 @@ export interface ShowStatusCommandDeps {
    * detect the degraded state from `$?` (#3386).
    */
   getGatewayHealth?: () => GatewayHealth;
-  checkMessagingBridgeHealth?: (
-    sandboxName: string,
-    channels: string[],
-  ) => MessagingBridgeHealth[];
+  checkMessagingBridgeHealth?: (sandboxName: string, channels: string[]) => MessagingBridgeHealth[];
   backfillAndFindOverlaps?: () => MessagingOverlap[];
   readGatewayLog?: (sandboxName: string) => string | null;
   log?: (message?: string) => void;
@@ -273,9 +273,16 @@ export function renderSandboxInventoryText(
     const def = sandbox.isDefault ? " *" : "";
     const model = (useLive && liveInference.model) || sandbox.model || "unknown";
     const provider = (useLive && liveInference.provider) || sandbox.provider || "unknown";
-    const modelDrifted = !!(useLive && liveInference.model && liveInference.model !== sandbox.model);
-    const providerDrifted =
-      !!(useLive && liveInference.provider && liveInference.provider !== sandbox.provider);
+    const modelDrifted = !!(
+      useLive &&
+      liveInference.model &&
+      liveInference.model !== sandbox.model
+    );
+    const providerDrifted = !!(
+      useLive &&
+      liveInference.provider &&
+      liveInference.provider !== sandbox.provider
+    );
     const gpu = sandbox.sandboxGpuEnabled ? "sandbox GPU" : "CPU sandbox";
     const presets = sandbox.policies.length > 0 ? sandbox.policies.join(", ") : "none";
     const connected = sandbox.connected ? " ●" : "";
@@ -369,9 +376,9 @@ export function getStatusReport(deps: ShowStatusCommandDeps): StatusReport {
   const gatewayHealth =
     deps.getGatewayHealth && sandboxes.length > 0 ? deps.getGatewayHealth() : null;
   const services =
-    deps.getServiceStatuses?.({ sandboxName: resolvedDefault || undefined }).map(
-      normalizeServiceStatus,
-    ) ?? [];
+    deps
+      .getServiceStatuses?.({ sandboxName: resolvedDefault || undefined })
+      .map(normalizeServiceStatus) ?? [];
 
   return {
     schemaVersion: 1,
@@ -470,6 +477,12 @@ export function showStatusCommand(deps: ShowStatusCommandDeps): void {
     if (overlaps.length > 0) {
       log("");
       for (const { channel, sandboxes: pair, reason } of overlaps) {
+        if (reason === "slack-socket-mode-gateway") {
+          log(
+            `  ⚠ '${pair[0]}' and '${pair[1]}' both have Slack Socket Mode enabled on the same gateway; only one sandbox can receive Slack Socket Mode events unless the gateway supports multiplexing.`,
+          );
+          continue;
+        }
         const detail =
           reason === "matching-token"
             ? `share the same ${channel} credential`
@@ -496,9 +509,7 @@ export function showStatusCommand(deps: ShowStatusCommandDeps): void {
       if (degraded.length > 0) {
         log("");
         for (const { channel, conflicts } of degraded) {
-          log(
-            `  ⚠ ${channel} bridge: degraded (${conflicts} conflict errors in /tmp/gateway.log)`,
-          );
+          log(`  ⚠ ${channel} bridge: degraded (${conflicts} conflict errors in /tmp/gateway.log)`);
         }
         log(
           "    Another sandbox is likely polling with the same bot token. See docs/reference/troubleshooting.mdx.",

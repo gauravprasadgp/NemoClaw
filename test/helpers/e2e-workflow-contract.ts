@@ -13,6 +13,10 @@ export type WorkflowJob = {
   secrets?: Record<string, string>;
   steps?: WorkflowStep[];
   with?: Record<string, string>;
+  strategy?: {
+    "fail-fast"?: boolean;
+    matrix?: Record<string, unknown>;
+  };
 };
 
 export type WorkflowStep = {
@@ -35,7 +39,7 @@ export type RunnerWorkflow = {
       inputs?: Record<string, { default?: unknown }>;
     };
   };
-  "true"?: {
+  true?: {
     workflow_call?: {
       inputs?: Record<string, { default?: unknown }>;
     };
@@ -48,6 +52,7 @@ export type RunnerWorkflow = {
 };
 
 export type CompositeAction = {
+  inputs?: Record<string, { default?: unknown }>;
   runs: {
     steps: WorkflowStep[];
   };
@@ -61,11 +66,15 @@ export function loadE2eWorkflowContract(): {
   runnerWorkflow: RunnerWorkflow;
   nightlyWorkflow: NightlyWorkflow;
   action: CompositeAction;
+  cliCoverageShardAction: CompositeAction;
 } {
   return {
     runnerWorkflow: readYaml<RunnerWorkflow>(".github/workflows/e2e-script.yaml"),
     nightlyWorkflow: readYaml<NightlyWorkflow>(".github/workflows/nightly-e2e.yaml"),
     action: readYaml<CompositeAction>(".github/actions/run-e2e-script/action.yaml"),
+    cliCoverageShardAction: readYaml<CompositeAction>(
+      ".github/actions/ci-cli-coverage-shard/action.yaml",
+    ),
   };
 }
 

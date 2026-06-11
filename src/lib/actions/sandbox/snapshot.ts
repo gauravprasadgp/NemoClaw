@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-
 import fs from "node:fs";
 import path from "node:path";
 import { dockerCapture, dockerInspect } from "../../adapters/docker";
-import { captureOpenshell, getOpenshellBinary, runOpenshell } from "../../adapters/openshell/runtime";
+import {
+  captureOpenshell,
+  getOpenshellBinary,
+  runOpenshell,
+} from "../../adapters/openshell/runtime";
 import { CLI_NAME } from "../../cli/branding";
 import { prompt as askPrompt } from "../../credentials/store";
 import { getSandboxDeleteOutcome } from "../../domain/sandbox/destroy";
@@ -102,7 +105,10 @@ function renderSnapshotTable(
 // have the legacy cluster container — trust the registered imageTag and fail
 // fast if it's missing. Only the "kubernetes" driver falls back to the
 // kubectl probe inside the gateway container.
-function resolveSrcPodImage(srcName: string, srcEntry?: SandboxEntry | { name: string }): string | null {
+function resolveSrcPodImage(
+  srcName: string,
+  srcEntry?: SandboxEntry | { name: string },
+): string | null {
   const registeredImage = (srcEntry as { imageTag?: string | null } | undefined)?.imageTag;
   const registeredDriver = (srcEntry as { openshellDriver?: string | null } | undefined)
     ?.openshellDriver;
@@ -127,8 +133,7 @@ function resolveSrcPodImage(srcName: string, srcEntry?: SandboxEntry | { name: s
       ],
       { ignoreError: true, timeout: 10000 },
     );
-    const img = output.trim().split(/\s+/)[0];
-    return img || null;
+    return output.trim().split(/\s+/)[0] || null;
   } catch {
     return null;
   }
@@ -367,9 +372,7 @@ export async function runSandboxSnapshot(
         const v = formatSnapshotVersion(entry);
         const nameSuffix = entry.name ? ` name=${entry.name}` : "";
         const itemSummary = `${result.backedUpDirs.length} directories, ${result.backedUpFiles.length} files`;
-        console.log(
-          `  ${G}\u2713${R} Snapshot ${v}${nameSuffix} created (${itemSummary})`,
-        );
+        console.log(`  ${G}\u2713${R} Snapshot ${v}${nameSuffix} created (${itemSummary})`);
         console.log(`    ${manifest.backupPath}`);
       } else {
         if (result.error) {
@@ -544,6 +547,33 @@ export async function runSandboxSnapshot(
         }
         snapshotExit(1);
       }
+      // #5027/#4538: openclaw.json restores via the generic copy strategy,
+      // which lands it at 0640. The always-on OpenClaw gateway needs the
+      // mutable config contract (setgid dir + group-writable openclaw.json) to
+      // keep writing config at runtime. Rebuild repairs this in its
+      // post-restore sequence; the standalone snapshot-restore path must do the
+      // same. Gated on openclaw.json having been restored (only OpenClaw
+      // declares it) and posture-aware (a no-op for shields-up/non-OpenClaw).
+      if (result.restoredFiles.includes("openclaw.json")) {
+        try {
+          const permRepair = shields.repairMutableConfigPerms(targetSandbox);
+          if (permRepair.applied && permRepair.verified) {
+            console.log(`  ${G}✓${R} OpenClaw config permissions restored`);
+          } else if (!permRepair.applied && permRepair.skipReason === "unreadable") {
+            console.warn(
+              `  Warning: could not verify OpenClaw config permissions: ${permRepair.reason}`,
+            );
+          } else if (permRepair.applied && !permRepair.verified) {
+            console.warn(
+              `  Warning: OpenClaw config permission repair incomplete: ${permRepair.errors.join("; ")}`,
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `  Warning: OpenClaw config permission repair errored: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       // Reconcile the target's policy presets to match the snapshot manifest
       // exactly — add anything the snapshot recorded but the target is
       // missing, and remove anything the target has that the snapshot did
@@ -587,6 +617,59 @@ export async function runSandboxSnapshot(
           }
           if (failed.length > 0) {
             console.warn(`  Warning: could not reconcile preset(s): ${failed.join("; ")}`);
+          }
+        }
+      }
+      // Reconcile custom policy presets (applied via --from-file/--from-dir).
+      // Their full content travels in the manifest, so re-apply by content
+      // (which also re-records them in the registry). Diff by content + source,
+      // not just name: a same-name preset whose body changed must be re-applied.
+      // Full replacement, mirroring the built-in preset reconcile above; skipped
+      // for legacy snapshots that predate the `customPolicies` field.
+      if (resolvedSnapshot && Array.isArray(resolvedSnapshot.customPolicies)) {
+        const snapshotCustom = resolvedSnapshot.customPolicies;
+        const currentCustom = registry.getCustomPolicies(targetSandbox);
+        const snapshotByName = new Map(snapshotCustom.map((entry) => [entry.name, entry]));
+        const currentByName = new Map(currentCustom.map((entry) => [entry.name, entry]));
+        const toRemove = currentCustom.filter((c) => !snapshotByName.has(c.name));
+        const toAdd = snapshotCustom.filter((sp) => {
+          const current = currentByName.get(sp.name);
+          return !current || current.content !== sp.content || current.sourcePath !== sp.sourcePath;
+        });
+
+        if (toRemove.length > 0 || toAdd.length > 0) {
+          const summary: string[] = [];
+          if (toAdd.length > 0) summary.push(`add ${toAdd.map((c) => c.name).join(", ")}`);
+          if (toRemove.length > 0) summary.push(`remove ${toRemove.map((c) => c.name).join(", ")}`);
+          console.log(`  Reconciling custom policies on '${targetSandbox}': ${summary.join("; ")}`);
+
+          const failed: string[] = [];
+          for (const entry of toRemove) {
+            try {
+              if (!policies.removePreset(targetSandbox, entry.name)) {
+                failed.push(`${entry.name} (remove failed)`);
+              }
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              failed.push(`${entry.name} (remove: ${message})`);
+            }
+          }
+          for (const entry of toAdd) {
+            try {
+              if (
+                !policies.applyPresetContent(targetSandbox, entry.name, entry.content, {
+                  custom: { sourcePath: entry.sourcePath },
+                })
+              ) {
+                failed.push(`${entry.name} (apply failed)`);
+              }
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              failed.push(`${entry.name} (apply: ${message})`);
+            }
+          }
+          if (failed.length > 0) {
+            console.warn(`  Warning: could not reconcile custom policy(ies): ${failed.join("; ")}`);
           }
         }
       }

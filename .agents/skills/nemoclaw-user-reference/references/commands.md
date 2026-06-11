@@ -246,6 +246,12 @@ Use `--control-ui-port <N>` to choose the host dashboard port for a sandbox.
 The value must be an integer from `1024` through `65535`.
 This flag takes precedence over `CHAT_UI_URL`, `NEMOCLAW_DASHBOARD_PORT`, the previous registry value, and the default port.
 
+<AgentOnly variant="hermes">
+
+For Hermes sandboxes, do not use port `8642`; NemoClaw reserves it for the Hermes OpenAI-compatible API and rejects it as a dashboard port before sandbox creation.
+
+</AgentOnly>
+
 If you enable Slack during onboarding, the wizard collects both the Bot Token (`SLACK_BOT_TOKEN`) and the App-Level Token (`SLACK_APP_TOKEN`).
 Socket Mode requires both tokens.
 The app-level token is stored in a dedicated `slack-app` OpenShell provider and forwarded to the sandbox alongside the bot token.
@@ -377,6 +383,8 @@ Use `--gpu` to require GPU passthrough and fail fast if an NVIDIA GPU is not det
 Use `--sandbox-gpu` or `--no-sandbox-gpu` to control only direct NVIDIA GPU access inside the sandbox.
 Use `--sandbox-gpu --sandbox-gpu-device <device>` to pass a specific OpenShell GPU device selector to `openshell sandbox create`; device selectors require explicit sandbox GPU enablement.
 On Linux Docker-driver gateways, NemoClaw can create the sandbox first and then recreate the OpenShell-managed Docker container with NVIDIA GPU access when that compatibility path is needed.
+When this compatibility path recreates the Docker container, NemoClaw uses an available NVIDIA CDI spec before falling back to Docker `--gpus all` or the NVIDIA runtime.
+On Jetson/Tegra hosts, it also adds the host group IDs that own `/dev/nvmap` and `/dev/nvhost-*` so the sandbox user can initialize CUDA.
 If the patch fails, onboarding keeps diagnostics and prints a manual cleanup command rather than deleting the failed sandbox automatically.
 
 Prerequisites:
@@ -576,8 +584,13 @@ Existing sandboxes do not auto-upgrade when a newer NemoClaw release ships a new
 
 `nemoclaw <name> status` prints the running OpenClaw version on the `Agent` line:
 
-```console
-$ nemoclaw my-assistant status
+```bash
+nemoclaw my-assistant status
+```
+
+Expected output:
+
+```text
 ...
     Agent:    OpenClaw v2026.5.27
 ...
@@ -597,8 +610,13 @@ Existing sandboxes do not auto-upgrade when a newer NemoClaw release ships a new
 
 `nemohermes <name> status` prints the running Hermes version on the `Agent` line:
 
-```console
-$ nemohermes my-assistant status
+```bash
+nemohermes my-assistant status
+```
+
+Expected output:
+
+```text
 ...
     Agent:    Hermes v2026.5.16
 ...
@@ -722,6 +740,15 @@ export OPENCLAW_GATEWAY_TOKEN="$TOKEN"
 The token is written to stdout with no surrounding text.
 A one-line security warning is written to stderr; pass `--quiet` (or `-q`) to suppress it.
 The command exits non-zero with a diagnostic on stderr when the sandbox is not registered or when the token cannot be retrieved (for example, if the sandbox is not running).
+
+The token also authenticates the Control UI config endpoint served by the gateway on the forwarded dashboard port.
+There is no `controlui.bootstrap.config.json` path; the supported endpoint is `/__openclaw/control-ui-config.json`, and it requires the token (unauthenticated requests return `401` with a JSON body):
+
+```bash
+TOKEN=$(nemoclaw my-assistant gateway-token --quiet)
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:18789/__openclaw/control-ui-config.json"
+```
 
 **Warning:**
 
@@ -850,6 +877,37 @@ If the preset is unknown or not currently applied, the command exits non-zero wi
 | `--dry-run` | Preview which endpoints would be removed without applying changes |
 
 Unchecking a preset in the onboard TUI checkbox also removes it from the sandbox.
+
+### `nemoclaw <name> policy-explain`
+
+Print a redacted summary of the active policy context for a sandbox so an agent or operator can reason about what is allowed, what is blocked, and how to request a change.
+The output covers the recorded tier, the applied presets (built-in and custom) with their allowed host categories, the known presets that are not applied, the inspect/add/remove commands that change policy, and the support boundaries between NemoClaw, OpenShell, and the agent.
+Raw policy YAML, rule bodies, and credential metadata are deliberately not included.
+
+```bash
+nemoclaw my-assistant policy-explain
+```
+
+Pass `--json` to emit the same context as a structured object for agent consumption:
+
+```bash
+nemoclaw my-assistant policy-explain --json
+```
+
+NemoClaw refreshes the rendered context inside the sandbox at `/sandbox/.openclaw/workspace/POLICY.md` whenever a preset is added or removed, and once at the end of the onboarding policy step.
+Pass `--write` to refresh that file on demand without changing the policy:
+
+```bash
+nemoclaw my-assistant policy-explain --write
+```
+
+The context also documents how a failed host or integration attempt should be classified.
+The classifications are `blocked-by-policy`, `missing-approval`, `unsupported`, and `unknown`, so the agent can pick a remediation step instead of surfacing a lower-level network error.
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit the policy context as a structured JSON object for agent consumption |
+| `--write` | Refresh `/sandbox/.openclaw/workspace/POLICY.md` inside the sandbox in addition to printing |
 
 ### `nemoclaw <name> hosts-add`
 
@@ -1068,6 +1126,18 @@ nemoclaw my-assistant skill remove my-skill
 Use the skill name from the `SKILL.md` frontmatter, not the local directory name.
 Skill names must contain only alphanumeric characters, dots, hyphens, and underscores, and cannot be `.` or `..`.
 
+### `nemoclaw <name> agents list`
+
+List the OpenClaw agents configured in the sandbox.
+This is a thin pass-through to `openclaw agents list` via `openshell sandbox exec`; the OpenClaw CLI owns the gateway `agents.list` call, output formatting, and binding summaries.
+Flags accepted by the in-sandbox CLI (`--json`, `--bindings`) are forwarded verbatim.
+
+```bash
+nemoclaw my-assistant agents list
+nemoclaw my-assistant agents list --json
+nemoclaw my-assistant agents list --bindings
+```
+
 ### `nemoclaw <name> agents add`
 
 Run the OpenClaw interactive add wizard inside the sandbox.
@@ -1217,6 +1287,10 @@ When the command is running from a source checkout, it reports that state and do
 Rebuild sandboxes whose base image is older than the one currently pinned by NemoClaw.
 NemoClaw resolves the digest of `ghcr.io/nvidia/nemoclaw/sandbox-base:latest` from the registry, then compares it against the digest each sandbox was created with.
 Sandboxes that match the current digest are left alone.
+NemoClaw also checks the build fingerprint recorded on each managed sandbox image.
+A sandbox needs upgrade when its agent version is stale, when its recorded NemoClaw image fingerprint differs from the running CLI, or both.
+Custom Dockerfile sandboxes are not classified by image drift because rebuilding them onto the default image would drop the custom image.
+Legacy sandboxes without a recorded fingerprint opt into this check after their next rebuild.
 
 ```bash
 nemoclaw upgrade-sandboxes [--check] [--auto] [--yes|-y]
@@ -1320,8 +1394,13 @@ Use this path only when the destination sandbox can be replaced by the selected 
 Mount the sandbox filesystem on the host machine via SSHFS for bidirectional file sharing.
 Files edited on the host appear instantly inside the sandbox, and vice versa.
 
-```console
-$ nemoclaw my-assistant share mount
+```bash
+nemoclaw my-assistant share mount
+```
+
+Expected output:
+
+```text
 ✓ Mounted /sandbox → ~/.nemoclaw/mounts/my-assistant
 ```
 
@@ -1360,8 +1439,13 @@ nemoclaw my-assistant share unmount
 
 Check whether the sandbox filesystem is currently mounted.
 
-```console
-$ nemoclaw my-assistant share status
+```bash
+nemoclaw my-assistant share status
+```
+
+Expected output:
+
+```text
 ● Mounted at ~/.nemoclaw/mounts/my-assistant
 ```
 
@@ -1431,7 +1515,7 @@ Show the current cloudflared public-URL tunnel status for the selected or defaul
 The output reports whether cloudflared is running, stopped, or stale, and includes the same recovery hint used by `nemoclaw status`.
 Selection honors `NEMOCLAW_SANDBOX_NAME`, then `NEMOCLAW_SANDBOX`, then `SANDBOX_NAME`, then the registry default.
 
-```console
+```bash
 nemoclaw tunnel status
 ```
 
@@ -1790,7 +1874,7 @@ Set them before running `nemoclaw onboard`.
 | `SANDBOX_NAME` | sandbox name | Compatibility spelling used after `NEMOCLAW_SANDBOX_NAME` and `NEMOCLAW_SANDBOX`. |
 | `NEMOCLAW_INSTALL_REF` | git ref | For internal installer commands: the git ref to install from. Overridden by the `--install-ref` flag. |
 | `NEMOCLAW_INSTALL_TAG` | release tag | For internal installer commands: the release tag to install. Defaults to the admin-promoted `lkg` tag when unset. Overridden by the `--install-tag` flag. |
-| `NEMOCLAW_VLLM_MODEL` | registry slug or Hugging Face model id | Selects the model the managed-vLLM install path serves. Recognised slugs: `deepseek-v4-flash`, `qwen3.6-27b`, `qwen3.6-35b-a3b-nvfp4`, `nemotron-3-nano-4b`, `deepseek-r1-distill-70b`. Unset uses the per-platform profile default. Gated models (e.g. `deepseek-r1-distill-70b`) require `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`. |
+| `NEMOCLAW_VLLM_MODEL` | registry slug or Hugging Face model id | Selects the model the managed-vLLM install path serves. Recognised slugs: `qwen3.6-27b`, `qwen3.6-35b-a3b-nvfp4`, `nemotron-3-nano-4b`, `deepseek-v4-flash`, `deepseek-r1-distill-70b`. Unset uses the per-platform profile default. Gated models (e.g. `deepseek-r1-distill-70b`) require `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`. |
 | `NEMOCLAW_MINIMAL_BOOTSTRAP` | `1` to enable | Skips default OpenClaw workspace-template seeding for new pristine workspaces. Existing files are not deleted; see Runtime Controls (use the `nemoclaw-user-manage-sandboxes` skill). |
 | `NEMOCLAW_MODEL_ROUTER_PYTHON` | absolute path | Pins the host Python interpreter used to create the Model Router virtual environment. Strict. NemoClaw probes only that interpreter and aborts with the failure reason if it does not qualify, rather than silently falling back to another python. Relative command names such as `python3.12` are rejected. When unset, NemoClaw probes `python3.13`, `python3.12`, `python3.11`, `python3.10`, and bare `python3`, retains every interpreter whose version is in `[3.10, 3.14)` and whose `ensurepip`, `pyexpat`, `ssl`, and `venv` stdlib modules import cleanly, and tries `python -m venv` on each in priority order until one succeeds. Set the pin when the auto-discovered interpreter is broken (for example, Homebrew `python@3.14` with a `pyexpat` dlopen mismatch on macOS). |
 
@@ -1819,6 +1903,36 @@ Hermes-specific provider authentication:
 | `NEMOCLAW_NOUS_AUTH_METHOD` | same as `NEMOCLAW_HERMES_AUTH_METHOD` | Nous-specific alias for Hermes Provider authentication selection. |
 | `NEMOCLAW_HERMES_TOOL_GATEWAYS` | comma-separated list | Selects managed Hermes tool gateways in non-interactive onboarding. Valid values are `nous-web`, `nous-image`, `nous-audio`, `nous-browser`, and `nous-code`; the `nous-` prefix is optional. Unknown values fail before sandbox creation. |
 | `NEMOCLAW_HERMES_TOOL_GATEWAY_PRESETS` | comma-separated list | Back-compatible alias for `NEMOCLAW_HERMES_TOOL_GATEWAYS`. |
+| `NEMOCLAW_EXTRA_PLACEHOLDER_KEYS` | whitespace- or comma-separated list of upper-snake env keys | Adds operator-supplied OpenShell provider rows so per-profile credentials such as `TELEGRAM_BOT_TOKEN_AGENT_A` flow through the same out-of-process placeholder injection that the canonical channel tokens use, instead of being baked into each Hermes profile `.env` as raw text. See [Extra placeholder keys](#extra-placeholder-keys) for the entry shape and validation rules. |
+
+</AgentOnly>
+
+<AgentOnly variant="hermes">
+
+#### Extra placeholder keys
+
+Set `NEMOCLAW_EXTRA_PLACEHOLDER_KEYS` before running `nemoclaw onboard` when one container hosts multiple Hermes profiles and each profile needs its own messaging-bridge credential.
+
+```bash
+export NEMOCLAW_EXTRA_PLACEHOLDER_KEYS="TELEGRAM_BOT_TOKEN_AGENT_A TELEGRAM_BOT_TOKEN_AGENT_B"
+export TELEGRAM_BOT_TOKEN_AGENT_A=<bot-A-token>
+export TELEGRAM_BOT_TOKEN_AGENT_B=<bot-B-token>
+nemoclaw onboard --agent hermes
+```
+
+For each entry, NemoClaw registers a generic OpenShell provider row that resolves the named env to its operator-supplied value at egress time.
+The Hermes profile `.env` files are operator-owned: write `${TELEGRAM_BOT_TOKEN_AGENT_A}` (or the matching placeholder for each entry) into the per-profile `.env` so the in-sandbox Hermes process inherits the OpenShell placeholder instead of a raw token.
+NemoClaw never reads, writes, or rewrites these `.env` files; verify after onboarding that each profile's `.env` references the placeholder and that no raw bot token value sits on disk.
+
+Entries are split on whitespace and commas and must match `^[A-Z][A-Z0-9_]{0,127}$`.
+Each entry must extend a canonical channel envKey with a non-empty `_<suffix>` (for example `TELEGRAM_BOT_TOKEN_AGENT_A`); the canonical envKeys are `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `WECHAT_BOT_TOKEN`, and `BRAVE_API_KEY`.
+Bare canonical envKeys, the control env itself, and arbitrary host secret names (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `KUBECONFIG`, and similar) are refused so they cannot leak into the sandbox provider gateway.
+Duplicates are dropped silently.
+The list is capped at 32 entries per sandbox.
+Offending tokens emit one warning each and are skipped.
+
+If a referenced env is unset at onboard time, the matching provider row is registered with a null token; the `upsertMessagingProviders` helper then skips the row, so no placeholder is attached to the OpenShell gateway and no Hermes profile can resolve it.
+Export the credential before running `nemoclaw onboard` for that profile.
 
 </AgentOnly>
 

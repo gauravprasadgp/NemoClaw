@@ -414,9 +414,7 @@ describe("inventory commands", () => {
 
     expect(backfillAndFindOverlaps).toHaveBeenCalled();
     expect(
-      lines.some((l) =>
-        l.includes("'alice' and 'bob' share the same telegram credential"),
-      ),
+      lines.some((l) => l.includes("'alice' and 'bob' share the same telegram credential")),
     ).toBe(true);
   });
 
@@ -444,6 +442,34 @@ describe("inventory commands", () => {
         l.includes(
           "'alice' and 'bob' may share a telegram credential; stored credential hashes are incomplete",
         ),
+      ),
+    ).toBe(true);
+  });
+
+  it("marks a shared-gateway Slack Socket Mode overlap as conflicted (#4953)", () => {
+    const lines: string[] = [];
+    const backfillAndFindOverlaps = vi
+      .fn()
+      .mockReturnValue([
+        { channel: "slack", sandboxes: ["alice", "bob"], reason: "slack-socket-mode-gateway" },
+      ]);
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [
+          { name: "alice", model: "m", messagingChannels: ["slack"] },
+          { name: "bob", model: "m", messagingChannels: ["slack"] },
+        ],
+        defaultSandbox: "alice",
+      }),
+      getLiveInference: () => null,
+      showServiceStatus: vi.fn(),
+      backfillAndFindOverlaps,
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(
+      lines.some((l) =>
+        l.includes("'alice' and 'bob' both have Slack Socket Mode enabled on the same gateway"),
       ),
     ).toBe(true);
   });
@@ -756,9 +782,7 @@ describe("inventory commands", () => {
     const lines: string[] = [];
     showStatusCommand({
       listSandboxes: () => ({
-        sandboxes: [
-          { name: "alpha", model: "stored-model", provider: "stored-provider" },
-        ],
+        sandboxes: [{ name: "alpha", model: "stored-model", provider: "stored-provider" }],
         defaultSandbox: "alpha",
       }),
       getLiveInference: () => ({ provider: "live-provider", model: "live-model" }),
